@@ -16,7 +16,13 @@ const demoDir = resolve(here, '../../demo');
 
 async function loadFixture(name: string) {
   const html = readFileSync(resolve(demoDir, name), 'utf8');
-  const dom = new JSDOM(html, { url: `https://example.test/${name}` });
+  return loadHtml(html, name);
+}
+
+async function loadHtml(html: string, cacheKey: string) {
+  const dom = new JSDOM(html, {
+    url: `https://example.test/${cacheKey}`,
+  });
 
   // jsdom does no layout, so offsetParent is always null and the extractor's
   // visibility guard would reject every control. Emulate layout: an element is
@@ -51,7 +57,9 @@ async function loadFixture(name: string) {
   }
 
   // Imported fresh per fixture so it binds the globals set above.
-  const { extractPage } = await import(`../src/content/extract.ts?${name}`);
+  const { extractPage } = await import(
+    `../src/content/extract.ts?${cacheKey}`
+  );
   return extractPage();
 }
 
@@ -174,6 +182,143 @@ check('detects changed field ids but not an identical page', () => {
     }),
     true,
   );
+});
+
+console.log('\ngoogle-form-clone.html');
+const googleForm = await loadFixture('google-form-clone.html');
+const googleById = new Map(googleForm.fields.map((f: any) => [f.fieldId, f]));
+
+check('extracts mixed native and ARIA fields without double-counting', () => {
+  assert.equal(
+    googleForm.fields.length,
+    4,
+    googleForm.fields.map((f: any) => `${f.fieldId}:${f.type}`).join(', '),
+  );
+  assert.deepEqual(
+    googleForm.fields.map((f: any) => f.type),
+    ['text', 'radio', 'checkbox', 'select'],
+  );
+});
+
+check('uses the listitem heading as the ARIA radio question', () => {
+  const field = googleById.get('commute');
+  assert.ok(field, 'commute radio group missing');
+  assert.equal(field.question, 'Preferred commute');
+  assert.equal(field.required, true);
+});
+
+check('extracts ARIA radio option values and labels', () => {
+  assert.deepEqual(googleById.get('commute').options, [
+    { value: 'public', label: 'Public transport' },
+    { value: 'drive', label: 'Drive' },
+  ]);
+});
+
+check('groups ARIA checkboxes and captures their selected value', () => {
+  const field = googleById.get('skills');
+  assert.ok(field, 'skills checkbox group missing');
+  assert.equal(field.question, 'Skills');
+  assert.deepEqual(
+    field.options.map((option: any) => option.value),
+    ['typescript', 'python'],
+  );
+  assert.equal(field.currentValue, 'typescript');
+});
+
+check('treats an ARIA listbox as a select', () => {
+  const field = googleById.get('office-location');
+  assert.ok(field, 'office-location listbox missing');
+  assert.equal(field.question, 'Office location');
+  assert.deepEqual(field.options, [
+    { value: 'blr', label: 'Bengaluru' },
+    { value: 'Pune', label: 'Pune' },
+  ]);
+});
+
+console.log('\nreadable-page.html');
+const readable = await loadFixture('readable-page.html');
+const editable = readable.fields.find(
+  (field: any) => field.type === 'contenteditable',
+);
+
+check('extracts readable headings and paragraphs with boundaries', () => {
+  assert.equal(
+    readable.readableText,
+    [
+      'Research fellowship',
+      'The fellowship supports independent research in trustworthy AI.',
+      'What you will do',
+      'Fellows publish their findings and present them to the community.',
+    ].join('\n\n'),
+  );
+});
+
+check('excludes navigation, hidden UI, forms, drafts, and password values', () => {
+  assert.doesNotMatch(
+    readable.readableText ?? '',
+    /Account|hidden deadline|invisible salary|noisy text|Password|never-extract|Existing draft|Privacy/,
+  );
+});
+
+check('advertises independently gated assistant capabilities', () => {
+  assert.deepEqual(readable.capabilities, [
+    'readablePageText',
+    'contentEditableFill',
+    'openUrl',
+  ]);
+});
+
+check('extracts a labelled contenteditable field with its current value', () => {
+  assert.ok(editable, 'contenteditable field missing');
+  assert.equal(editable.fieldId, 'Reply body');
+  assert.equal(editable.question, 'Reply body');
+  assert.equal(editable.currentValue, 'Existing draft');
+});
+
+const { ASSISTANT_FEATURES } = await import('../src/features.ts');
+const mutableFeatures = ASSISTANT_FEATURES as unknown as Record<string, boolean>;
+mutableFeatures.readablePageText = false;
+mutableFeatures.contentEditableFill = false;
+const gated = await loadFixture('readable-page.html');
+mutableFeatures.readablePageText = true;
+mutableFeatures.contentEditableFill = true;
+
+check('feature switches remove readable text and contenteditable extraction', () => {
+  assert.equal(gated.readableText, undefined);
+  assert.equal(
+    gated.fields.some((field: any) => field.type === 'contenteditable'),
+    false,
+  );
+  assert.deepEqual(gated.capabilities, ['openUrl']);
+});
+
+const duplicateEditors = await loadHtml(
+  `<main>
+    <div role="textbox" contenteditable="true" aria-label="Message Body">First</div>
+    <div role="textbox" contenteditable="true" aria-label="Message Body">Second</div>
+  </main>`,
+  'duplicate-editors',
+);
+
+check('gives duplicate rich editors distinct deterministic ids', () => {
+  assert.deepEqual(
+    duplicateEditors.fields.map((field: any) => field.fieldId),
+    ['Message Body:1', 'Message Body:2'],
+  );
+});
+
+const longReadable = await loadHtml(
+  `<main><h1>Long page</h1><p>${'deterministic text '.repeat(2_000)}</p></main>`,
+  'long-readable',
+);
+const longReadableAgain = await loadHtml(
+  `<main><h1>Long page</h1><p>${'deterministic text '.repeat(2_000)}</p></main>`,
+  'long-readable-again',
+);
+
+check('truncates long readable text deterministically at 16k', () => {
+  assert.equal(longReadable.readableText?.length, 16_000);
+  assert.equal(longReadable.readableText, longReadableAgain.readableText);
 });
 
 console.log(

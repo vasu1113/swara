@@ -137,10 +137,21 @@ def run_turn(
     # Google Form's radio groups, for instance, are div[role=radio] and were
     # invisible to the extractor. Executing those does nothing while the agent
     # cheerfully reports success, so discard them before they are announced.
+    capabilities = set(page.capabilities or [])
+    result.actions = [
+        action
+        for action in result.actions
+        if action.action != "open_url" or "openUrl" in capabilities
+    ]
+
     known = {field.field_id for field in page.fields}
     known.update(control.control_id for control in page.controls)
     if known:
-        kept = [action for action in result.actions if action.field_id in known]
+        kept = [
+            action
+            for action in result.actions
+            if action.field_id in known or action.action == "open_url"
+        ]
         if len(kept) != len(result.actions):
             dropped = [a.field_id for a in result.actions if a.field_id not in known]
             logger.warning("Dropped actions for unknown fields: %s", dropped)

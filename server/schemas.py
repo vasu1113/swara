@@ -14,9 +14,15 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-FieldType = Literal["text", "textarea", "select", "checkbox", "radio"]
+FieldType = Literal[
+    "text", "textarea", "select", "checkbox", "radio", "contenteditable"
+]
 ActionType = Literal[
-    "fill", "select", "check", "uncheck", "clear", "click", "scroll_to"
+    "fill", "select", "check", "uncheck", "clear", "click", "scroll_to",
+    "open_url",
+]
+AssistantCapability = Literal[
+    "readablePageText", "contentEditableFill", "openUrl"
 ]
 MemoryType = Literal["fact", "correction", "preference", "instruction"]
 MemoryScope = Literal["persistent", "session", "task"]
@@ -74,6 +80,8 @@ class PageContext(Base):
     url: str
     title: str
     heading: str | None = None
+    readable_text: str | None = None
+    capabilities: list[AssistantCapability] | None = None
     fields: list[FormField] = Field(default_factory=list)
     controls: list[PageControl] = Field(default_factory=list)
 

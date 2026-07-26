@@ -1,8 +1,12 @@
 import type { Action, ActionResult } from '../types';
+import { ASSISTANT_FEATURES } from '../features';
 import {
+  ariaOptionLabel,
+  ariaOptionValue,
   collectExtractableControlTargets,
   collectExtractableFieldTargets,
   isExtractableControl,
+  type ExtractableFieldElement,
   type ExtractableControlTarget,
   type FormControlElement,
 } from './extract';
@@ -15,6 +19,48 @@ type HighlightState = {
 
 const activeHighlights = new WeakMap<HTMLElement, HighlightState>();
 
+function isContentEditableElement(element: Element): element is HTMLElement {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  const editable = element.getAttribute('contenteditable');
+  const hasEditableRole =
+    element.getAttribute('role') === 'textbox' &&
+    editable !== null &&
+    editable.toLocaleLowerCase() !== 'false';
+  const enabled =
+    element.getAttribute('aria-disabled')?.toLocaleLowerCase() !== 'true';
+  const rendered =
+    element.offsetParent !== null ||
+    window.getComputedStyle(element).position === 'fixed';
+
+  return (
+    (editable?.toLocaleLowerCase() === 'true' || hasEditableRole) &&
+    enabled &&
+    rendered
+  );
+}
+
+function contentEditableWithIdentifier(
+  fieldId: string,
+): HTMLElement | undefined {
+  if (!ASSISTANT_FEATURES.contentEditableFill) return undefined;
+  const matches = Array.from(
+    document.querySelectorAll(
+      '[contenteditable="true"], [role="textbox"][contenteditable]',
+    ),
+  )
+    .filter(isContentEditableElement)
+    .filter(
+      (element) =>
+        element.getAttribute('name') === fieldId ||
+        element.getAttribute('aria-label') === fieldId ||
+        element.getAttribute('aria-labelledby') === fieldId,
+    );
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
 function controlsWithName(name: string): FormControlElement[] {
   return Array.from(
     document.querySelectorAll('input, textarea, select'),
@@ -25,15 +71,25 @@ function controlsWithName(name: string): FormControlElement[] {
   );
 }
 
-function resolveControls(fieldId: string): FormControlElement[] {
+function resolveControls(fieldId: string): ExtractableFieldElement[] {
   const byId = document.getElementById(fieldId);
-  if (byId && isExtractableControl(byId)) {
+  if (
+    byId &&
+    (isExtractableControl(byId) ||
+      (ASSISTANT_FEATURES.contentEditableFill &&
+        isContentEditableElement(byId)))
+  ) {
     return [byId];
   }
 
   const byName = controlsWithName(fieldId);
   if (byName.length > 0) {
     return byName;
+  }
+
+  const editable = contentEditableWithIdentifier(fieldId);
+  if (editable) {
+    return [editable];
   }
 
   const positional = collectExtractableFieldTargets().find(
@@ -67,7 +123,7 @@ function scrollIntoView(element: HTMLElement): void {
 }
 
 function focusAndBlur(
-  element: FormControlElement,
+  element: HTMLElement,
   update: () => void,
 ): void {
   element.focus();
@@ -78,9 +134,79 @@ function focusAndBlur(
   }
 }
 
-function dispatchValueEvents(element: FormControlElement): void {
+function dispatchValueEvents(element: HTMLElement): void {
   element.dispatchEvent(new Event('input', { bubbles: true }));
   element.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function editableInputEvent(
+  type: 'beforeinput' | 'input',
+  value: string,
+  inputType: 'insertText' | 'deleteContentBackward',
+): Event {
+  if (typeof window.InputEvent === 'function') {
+    return new window.InputEvent(type, {
+      bubbles: true,
+      cancelable: type === 'beforeinput',
+      composed: true,
+      data: value || null,
+      inputType,
+    });
+  }
+
+  return new Event(type, {
+    bubbles: true,
+    cancelable: type === 'beforeinput',
+    composed: true,
+  });
+}
+
+function replaceContentEditableContents(
+  element: HTMLElement,
+  value: string,
+): void {
+  const inputType = value ? 'insertText' : 'deleteContentBackward';
+  if (!element.dispatchEvent(editableInputEvent('beforeinput', value, inputType))) {
+    throw new Error('The page cancelled the edit');
+  }
+
+  const selection = window.getSelection();
+  if (!selection) {
+    throw new Error('The browser selection API is unavailable');
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  selection.removeAllRanges();
+  selection.addRange(range);
+
+  const execCommand = document.execCommand?.bind(document);
+  const inserted =
+    typeof execCommand === 'function' &&
+    execCommand(value ? 'insertText' : 'delete', false, value);
+
+  // jsdom and some isolated editors do not implement execCommand. The Range
+  // fallback preserves the same select-all-and-replace semantics.
+  if (!inserted) {
+    range.deleteContents();
+    if (value) {
+      const text = document.createTextNode(value);
+      range.insertNode(text);
+      range.setStartAfter(text);
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  }
+
+  element.dispatchEvent(editableInputEvent('input', value, inputType));
+  element.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function setContentEditableValue(element: HTMLElement, value: string): void {
+  focusAndBlur(element, () => {
+    replaceContentEditableContents(element, value);
+  });
 }
 
 function setTextValue(
@@ -157,7 +283,7 @@ function highlight(element: HTMLElement): void {
 }
 
 function textControl(
-  controls: FormControlElement[],
+  controls: ExtractableFieldElement[],
 ): HTMLInputElement | HTMLTextAreaElement | undefined {
   return controls.find(
     (control): control is HTMLInputElement | HTMLTextAreaElement =>
@@ -168,8 +294,14 @@ function textControl(
   );
 }
 
+function contentEditableControl(
+  controls: ExtractableFieldElement[],
+): HTMLElement | undefined {
+  return controls.find(isContentEditableElement);
+}
+
 function matchingInput(
-  controls: FormControlElement[],
+  controls: ExtractableFieldElement[],
   type: 'radio' | 'checkbox',
   value: string,
 ): HTMLInputElement | undefined {
@@ -185,19 +317,89 @@ function normalizedOptionLabel(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase();
 }
 
+function isAriaOption(
+  element: ExtractableFieldElement,
+  role: 'radio' | 'checkbox' | 'option',
+): element is HTMLElement {
+  return (
+    !(element instanceof HTMLInputElement) &&
+    !(element instanceof HTMLTextAreaElement) &&
+    !(element instanceof HTMLSelectElement) &&
+    element.getAttribute('role') === role
+  );
+}
+
+function matchingAriaOption(
+  controls: ExtractableFieldElement[],
+  role: 'radio' | 'checkbox' | 'option',
+  value: string,
+): HTMLElement | undefined {
+  const normalized = normalizedOptionLabel(value);
+  return controls
+    .filter((element) => isAriaOption(element, role))
+    .find(
+      (element) =>
+        normalizedOptionLabel(ariaOptionValue(element)) === normalized ||
+        normalizedOptionLabel(ariaOptionLabel(element)) === normalized,
+    );
+}
+
+function ariaOptionState(element: HTMLElement): boolean {
+  return (
+    element.getAttribute('aria-checked')?.toLocaleLowerCase() === 'true' ||
+    element.getAttribute('aria-selected')?.toLocaleLowerCase() === 'true'
+  );
+}
+
+function clickAriaOption(element: HTMLElement): void {
+  scrollIntoView(element);
+  element.click();
+}
+
+function refreshedAriaSelectControls(
+  fieldId: string,
+  controls: ExtractableFieldElement[],
+): ExtractableFieldElement[] {
+  const group = controls.find(
+    (element) =>
+      element.getAttribute('role') === 'combobox' ||
+      element.getAttribute('role') === 'listbox',
+  );
+  if (group?.getAttribute('role') === 'combobox') {
+    scrollIntoView(group);
+    group.click();
+  }
+
+  return (
+    collectExtractableFieldTargets().find(
+      (target) => target.fieldId === fieldId,
+    )?.elements ?? controls
+  );
+}
+
 function executeAction(
-  controls: FormControlElement[],
+  controls: ExtractableFieldElement[],
   action: Action,
 ): HTMLElement {
   switch (action.action) {
     case 'fill':
     case 'clear': {
       const control = textControl(controls);
-      if (!control) {
-        throw new Error(`${action.action} requires a text input or textarea`);
+      const value = action.action === 'clear' ? '' : action.value;
+      if (control) {
+        setTextValue(control, value);
+        return control;
       }
-      setTextValue(control, action.action === 'clear' ? '' : action.value);
-      return control;
+
+      const editable = contentEditableControl(controls);
+      if (editable && ASSISTANT_FEATURES.contentEditableFill) {
+        setContentEditableValue(editable, value);
+        return editable;
+      }
+
+      throw new Error(
+        `${action.action} requires a text input, textarea, or contenteditable`,
+      );
     }
 
     case 'select': {
@@ -224,6 +426,37 @@ function executeAction(
         return select;
       }
 
+      const ariaRadio = matchingAriaOption(controls, 'radio', action.value);
+      if (ariaRadio) {
+        clickAriaOption(ariaRadio);
+        return ariaRadio;
+      }
+
+      const refreshedControls = refreshedAriaSelectControls(
+        action.fieldId,
+        controls,
+      );
+      const ariaListboxOption = matchingAriaOption(
+        refreshedControls,
+        'option',
+        action.value,
+      );
+      if (ariaListboxOption) {
+        clickAriaOption(ariaListboxOption);
+        return ariaListboxOption;
+      }
+
+      if (
+        controls.some(
+          (control) =>
+            control.getAttribute('role') === 'combobox' ||
+            control.getAttribute('role') === 'listbox' ||
+            control.getAttribute('role') === 'option',
+        )
+      ) {
+        throw new Error(`ARIA select option "${action.value}" was not found`);
+      }
+
       const radio = matchingInput(controls, 'radio', action.value);
       if (!radio) {
         throw new Error(`Radio option "${action.value}" was not found`);
@@ -234,6 +467,19 @@ function executeAction(
 
     case 'check':
     case 'uncheck': {
+      const ariaCheckbox = matchingAriaOption(
+        controls,
+        'checkbox',
+        action.value,
+      );
+      if (ariaCheckbox) {
+        const desired = action.action === 'check';
+        if (ariaOptionState(ariaCheckbox) !== desired) {
+          clickAriaOption(ariaCheckbox);
+        }
+        return ariaCheckbox;
+      }
+
       const checkbox = matchingInput(controls, 'checkbox', action.value);
       if (!checkbox) {
         throw new Error(`Checkbox option "${action.value}" was not found`);
@@ -244,6 +490,7 @@ function executeAction(
 
     case 'click':
     case 'scroll_to':
+    case 'open_url':
       throw new Error(`${action.action} is not a field action`);
   }
 }

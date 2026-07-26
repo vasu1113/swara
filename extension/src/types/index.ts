@@ -10,7 +10,18 @@
  * Page / form extraction (content script -> side panel -> server)
  * ------------------------------------------------------------------ */
 
-export type FieldType = 'text' | 'textarea' | 'select' | 'checkbox' | 'radio';
+export type FieldType =
+  | 'text'
+  | 'textarea'
+  | 'select'
+  | 'checkbox'
+  | 'radio'
+  | 'contenteditable';
+
+export type AssistantCapability =
+  | 'readablePageText'
+  | 'contentEditableFill'
+  | 'openUrl';
 
 export type FieldOption = {
   /** The value actually submitted, i.e. the element's `value` attribute. */
@@ -58,6 +69,10 @@ export type PageContext = {
   title: string;
   /** The page's main heading, e.g. the job title. Useful planner context. */
   heading?: string;
+  /** Visible page prose for summarisation and question-answering. */
+  readableText?: string;
+  /** Additive features supported by this extension build. */
+  capabilities?: AssistantCapability[];
   fields: FormField[];
   controls: PageControl[];
 };
@@ -73,7 +88,8 @@ export type ActionType =
   | 'uncheck'
   | 'clear'
   | 'click'
-  | 'scroll_to';
+  | 'scroll_to'
+  | 'open_url';
 
 export type Action = {
   fieldId: string;

@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { API_BASE_URL } from './api';
+import { executeRoutedActions } from './actionRouting';
 import {
   AUDIO_SAMPLE_RATE,
   SESSION_PATH,
@@ -141,6 +142,37 @@ async function sendToActiveTab(message: SwaraMessage): Promise<unknown> {
   });
 }
 
+async function sendToTab(tabId: number, message: SwaraMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.sendMessage(tabId, message, (response: unknown) => {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        reject(new Error(contentScriptError(lastError.message)));
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
+async function waitForTabLoad(tabId: number, timeoutMs = 10_000): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timeout = window.setTimeout(finish, timeoutMs);
+    function finish() {
+      window.clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve();
+    }
+    function onUpdated(updatedTabId: number, change: chrome.tabs.TabChangeInfo) {
+      if (updatedTabId === tabId && change.status === 'complete') finish();
+    }
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    void chrome.tabs.get(tabId).then((tab) => {
+      if (tab.status === 'complete') finish();
+    }).catch(finish);
+  });
+}
+
 async function openPermissionPage(): Promise<string | null> {
   const url = chrome.runtime.getURL('src/permission/index.html');
   try {
@@ -178,9 +210,12 @@ function fromBase64(value: string): Uint8Array {
 }
 
 function actionSummary(actions: Action[], results?: ActionResult[]): string {
-  if (!results) return `Working on ${actions.length} ${actions.length === 1 ? 'field' : 'fields'}…`;
+  const hasBrowserAction = actions.some((action) => action.action === 'open_url');
+  const noun = hasBrowserAction ? 'action' : 'field';
+  if (!results) return `Working on ${actions.length} ${actions.length === 1 ? noun : `${noun}s`}…`;
   const completed = results.filter((result) => result.ok).length;
-  return `Filled ${completed} of ${results.length} ${results.length === 1 ? 'field' : 'fields'}`;
+  const verb = hasBrowserAction ? 'Completed' : 'Filled';
+  return `${verb} ${completed} of ${results.length} ${results.length === 1 ? noun : `${noun}s`}`;
 }
 
 function App() {
@@ -208,6 +243,7 @@ function App() {
   const audioCompleteRef = useRef(false);
   const pcmPlayerRef = useRef<PcmPlayer>(new PcmPlayer());
   const activeActionRef = useRef<string | null>(null);
+  const pageRef = useRef<PageContext | null>(null);
   const startingRef = useRef(false);
   const agentStateRef = useRef<AgentState>('idle');
   const mountedRef = useRef(true);
@@ -366,9 +402,39 @@ function App() {
     setConversation((items) => [...items, { id, kind: 'actions', actions }]);
     setAgentState('acting');
     try {
-      const response = await sendToActiveTab({ type: 'SWARA_EXECUTE', actions });
-      const results = extractResults(response);
-      if (!results) throw new Error('The page returned an invalid action result. Try reloading the tab.');
+      const results = await executeRoutedActions(actions, {
+        allowOpenUrl: pageRef.current?.capabilities?.includes('openUrl') === true,
+        executeDomActions: async (domActions) => {
+          const response = await sendToActiveTab({ type: 'SWARA_EXECUTE', actions: domActions });
+          const domResults = extractResults(response);
+          if (!domResults) throw new Error('The page returned an invalid action result. Try reloading the tab.');
+          return domResults;
+        },
+        openTab: async (url) => {
+          const tab = await chrome.tabs.create({ url });
+          if (tab.id === undefined) throw new Error('Chrome did not return the opened tab.');
+          // Updating the live session is best-effort: the requested page is
+          // already open even when loading or extraction takes a while. Do
+          // not delay action.result, which belongs to this exact action batch.
+          void (async () => {
+            await waitForTabLoad(tab.id!);
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              try {
+                const response = await sendToTab(tab.id!, { type: 'SWARA_EXTRACT' });
+                const page = extractPage(response);
+                if (page) {
+                  pageRef.current = page;
+                  send({ type: 'page.update', page });
+                  return;
+                }
+              } catch {
+                // Content-script injection can lag just behind tab completion.
+              }
+              await new Promise((resolve) => window.setTimeout(resolve, 500));
+            }
+          })();
+        },
+      });
       updateActionResults(id, results);
       send({ type: 'action.result', results });
     } catch (actionError) {
@@ -518,6 +584,7 @@ function App() {
       if (!startingRef.current) return;
       const page = extractPage(response);
       if (!page) throw new Error('The page returned an invalid scan result. Reload the tab, then try again.');
+      pageRef.current = page;
 
       const socket = new WebSocket(sessionUrl());
       socketRef.current = socket;
