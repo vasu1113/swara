@@ -25,7 +25,7 @@ export type FormField = {
    * Derivation order: element `id` -> element `name` -> `<tag>:<index>`.
    * Radio and checkbox groups share one id (their common `name`).
    */
-  field_id: string;
+  fieldId: string;
   /** Cleaned label text, with asterisks/aria-hidden/hint nodes stripped. */
   label: string;
   /**
@@ -59,7 +59,7 @@ export type PageContext = {
 export type ActionType = 'fill' | 'select' | 'check' | 'uncheck' | 'clear';
 
 export type Action = {
-  field_id: string;
+  fieldId: string;
   action: ActionType;
   /**
    * For `fill`: the literal text. For `select`/`check`/`uncheck`: the option
@@ -71,7 +71,7 @@ export type Action = {
 };
 
 export type ActionResult = {
-  field_id: string;
+  fieldId: string;
   ok: boolean;
   error?: string;
 };

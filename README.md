@@ -48,19 +48,27 @@ swara/
 cd extension
 npm install
 npm run build
+npm test          # runs the extractor against the demo fixtures in jsdom
 ```
 
-Then open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select the `extension/dist` directory.
+Then open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select the `extension/dist` directory. To use the fixtures in `demo/`, also enable **Allow access to file URLs** on the extension's details page.
 
 ### Server
 
 ```bash
 cd server
-pip install -r requirements.txt
-uvicorn app:app --reload
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/uvicorn app:app --reload --port 8787
 ```
 
-The server starts on `http://localhost:8000` by default.
+The server runs on `http://localhost:8787`. Port 8000 is deliberately avoided — it collides with too many other local dev servers. The extension's base URL lives in `extension/src/sidepanel/api.ts`.
+
+Seed the context vault once the server is up:
+
+```bash
+curl -X POST localhost:8787/context/seed
+```
 
 ## Configuration
 
