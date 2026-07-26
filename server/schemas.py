@@ -73,6 +73,15 @@ class Action(Base):
     reasoning: str | None = None
 
 
+class ActionResult(Base):
+    """Reported back by the content script so the agent can be honest about
+    what actually happened rather than assuming its plan succeeded."""
+
+    field_id: str
+    ok: bool
+    error: str | None = None
+
+
 # --------------------------------------------------------------------- #
 # Memory classification
 # --------------------------------------------------------------------- #
