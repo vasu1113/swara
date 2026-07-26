@@ -31,6 +31,12 @@ export default defineManifest({
       resources: ['src/vault/index.html'],
       matches: ['<all_urls>'],
     },
+    {
+      // AudioWorklet.addModule is gated by web_accessible_resources under MV3.
+      // Served from public/ at a stable path so no content hash is involved.
+      resources: ['worklet.js'],
+      matches: ['<all_urls>'],
+    },
   ],
   action: {
     default_title: 'Open Swara',

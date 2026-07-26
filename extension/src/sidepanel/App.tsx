@@ -412,7 +412,12 @@ function App() {
     // phantom words.
     const audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
     try {
-      await audioContext.audioWorklet.addModule(new URL('./worklet.ts', import.meta.url));
+      // Served verbatim from public/ at a stable, unhashed path. Vite's
+      // `new URL('./worklet.ts', import.meta.url)` emits a content-hashed
+      // asset, which MV3 then gates behind web_accessible_resources and which
+      // changes name every build — a fragile dependency for something whose
+      // failure silently disables the microphone.
+      await audioContext.audioWorklet.addModule(chrome.runtime.getURL('worklet.js'));
       const source = audioContext.createMediaStreamSource(stream);
       const worklet = new AudioWorkletNode(audioContext, 'swara-pcm-capture', {
         processorOptions: { targetSampleRate: AUDIO_SAMPLE_RATE },
