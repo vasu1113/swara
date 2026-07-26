@@ -1,0 +1,135 @@
+"""Shared contract schemas for Swara.
+
+This mirrors `extension/src/types/index.ts`. The two files are one contract in
+two languages — change both together or the halves silently disagree.
+
+Wire format is camelCase (the extension speaks TypeScript); the aliases below
+handle the translation so Python code stays snake_case.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
+
+FieldType = Literal["text", "textarea", "select", "checkbox", "radio"]
+ActionType = Literal["fill", "select", "check", "uncheck", "clear"]
+MemoryType = Literal["fact", "correction", "preference", "instruction"]
+MemoryScope = Literal["persistent", "session", "task"]
+ContextItemType = Literal[
+    "fact", "document", "preference", "correction", "instruction"
+]
+
+
+class Base(BaseModel):
+    """camelCase on the wire, snake_case in Python, populate by either name."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+
+# --------------------------------------------------------------------- #
+# Page / form extraction
+# --------------------------------------------------------------------- #
+
+
+class FieldOption(Base):
+    value: str
+    label: str
+
+
+class FormField(Base):
+    field_id: str
+    label: str
+    question: str
+    type: FieldType
+    required: bool = False
+    options: list[FieldOption] = Field(default_factory=list)
+    placeholder: str | None = None
+    max_length: int | None = None
+    current_value: str | None = None
+
+
+class PageContext(Base):
+    url: str
+    title: str
+    heading: str | None = None
+    fields: list[FormField] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------- #
+# Actions
+# --------------------------------------------------------------------- #
+
+
+class Action(Base):
+    field_id: str
+    action: ActionType
+    value: str = ""
+    reasoning: str | None = None
+
+
+# --------------------------------------------------------------------- #
+# Memory classification
+# --------------------------------------------------------------------- #
+
+
+class MemoryUpdate(Base):
+    type: MemoryType
+    key: str
+    value: str
+    old_value: str | None = None
+    scope: MemoryScope
+    reason: str
+
+
+# --------------------------------------------------------------------- #
+# Planning
+# --------------------------------------------------------------------- #
+
+
+class ContextUsage(Base):
+    key: str
+    summary: str
+    reason: str
+
+
+class PlanRequest(Base):
+    session_id: str
+    page: PageContext
+    instruction: str
+
+
+class PlanResponse(Base):
+    status: Literal["ready", "needs_clarification"] = "ready"
+    actions: list[Action] = Field(default_factory=list)
+    clarifications: list[str] = Field(default_factory=list)
+    memory_updates: list[MemoryUpdate] = Field(default_factory=list)
+    unresolved: list[str] = Field(default_factory=list)
+    relevant_context: list[ContextUsage] = Field(default_factory=list)
+    excluded_context: list[ContextUsage] = Field(default_factory=list)
+    spoken_summary: str = ""
+
+
+# --------------------------------------------------------------------- #
+# Context vault rows (mirrors the Supabase schema)
+# --------------------------------------------------------------------- #
+
+
+class ContextItem(Base):
+    id: str | None = None
+    type: ContextItemType
+    category: str | None = None
+    key: str
+    value: str
+    source: str | None = None
+    source_type: str | None = None
+    confidence: float = 1.0
+    scope: MemoryScope = "persistent"
+    session_id: str | None = None
+    document_id: str | None = None
+    superseded_by: str | None = None
