@@ -23,6 +23,15 @@ export default defineManifest({
   // Chrome refuses to show the getUserMedia prompt inside a side panel, so the
   // panel sends the user to this page to grant it once for the extension origin.
   options_page: 'src/permission/index.html',
+  web_accessible_resources: [
+    {
+      // The side panel opens this extension-owned full page with
+      // chrome.runtime.getURL; listing it keeps CRX's production build aware
+      // of the otherwise independent HTML entry point.
+      resources: ['src/vault/index.html'],
+      matches: ['<all_urls>'],
+    },
+  ],
   action: {
     default_title: 'Open Swara',
   },

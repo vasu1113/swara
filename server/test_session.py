@@ -39,6 +39,13 @@ class FakeSTTSocket:
         encoding: str = "audio/wav",
         sample_rate: int = 16_000,
     ) -> None:
+        # The real SDK validates this as a literal and raises on anything else.
+        # The fake must too: without it this test passed against an encoding
+        # the live API rejects, which is how the bug reached a browser.
+        if encoding != "audio/wav":
+            raise ValueError(
+                f"encoding must be 'audio/wav', got {encoding!r}"
+            )
         self.transcriptions.append((audio, encoding, sample_rate))
         self.responses.put(
             {"type": "events", "data": {"signal_type": "START_SPEECH"}}
@@ -305,7 +312,7 @@ class LiveSessionTest(unittest.TestCase):
         )
         self.assertEqual(
             fake_sarvam.stt_socket.transcriptions,
-            [("cGNt", "pcm_s16le", 16_000)],
+            [("cGNt", "audio/wav", 16_000)],
         )
         self.assertTrue(
             all(

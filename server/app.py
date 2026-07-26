@@ -12,6 +12,7 @@ from documents import router as documents_router
 from planner import plan
 from schemas import ContextItem, MemoryApplyRequest, PlanRequest, PlanResponse
 from session import live_session
+from vault import router as vault_router
 from voice import router as voice_router
 
 
@@ -73,6 +74,8 @@ def apply_memory(request: MemoryApplyRequest) -> list[ContextItem]:
     ]
 
 
+# This router is first so uploads return before the OCR background work begins.
+app.include_router(vault_router)
 app.include_router(documents_router)
 app.add_api_websocket_route("/session/live", live_session)
 app.include_router(voice_router)

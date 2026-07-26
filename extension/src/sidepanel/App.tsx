@@ -87,6 +87,16 @@ async function openPermissionPage(): Promise<string | null> {
   }
 }
 
+async function openVaultPage(): Promise<string | null> {
+  const url = chrome.runtime.getURL('src/vault/index.html');
+  try {
+    await chrome.tabs.create({ url });
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : `Could not open ${url}.`;
+  }
+}
+
 function toBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   const parts: string[] = [];
@@ -443,9 +453,12 @@ function App() {
     <main className="app">
       <header className="app-header">
         <h1>Swara</h1>
-        <div className={`agent-state agent-state--${agentState}`} aria-live="polite">
-          <span className="state-mark" aria-hidden="true"><i /><i /><i /></span>
-          <span>{stateLabel(agentState)}</span>
+        <div className="header-actions">
+          <button className="vault-link" type="button" onClick={() => void openVaultPage()}>Manage vault</button>
+          <div className={`agent-state agent-state--${agentState}`} aria-live="polite">
+            <span className="state-mark" aria-hidden="true"><i /><i /><i /></span>
+            <span>{stateLabel(agentState)}</span>
+          </div>
         </div>
       </header>
 

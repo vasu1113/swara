@@ -9,6 +9,7 @@ loop.
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import threading
 from contextlib import suppress
@@ -33,6 +34,8 @@ from session_schemas import (
     TurnResult,
 )
 
+
+logger = logging.getLogger("swara.session")
 
 router = APIRouter()
 
@@ -223,9 +226,14 @@ class _STTBridge:
                                 socket.flush()
                         break
                     if command == "audio":
+                        # `encoding` here is a fixed literal and rejects
+                        # anything else; the real codec is declared once at
+                        # connect() via input_audio_codec. Passing the codec
+                        # per chunk raises on the first frame and kills this
+                        # thread, after which every send reports "busy".
                         socket.transcribe(
                             payload,
-                            encoding="pcm_s16le",
+                            encoding="audio/wav",
                             sample_rate=AUDIO_SAMPLE_RATE,
                         )
         except Exception as exc:
@@ -730,6 +738,9 @@ class _LiveSession:
                 elif kind == "stt.message":
                     await self._handle_stt(payload)
                 elif kind == "stt.error":
+                    # Also log it: the client only ever showed a generic
+                    # "unavailable or busy", which hid the real cause.
+                    logger.error("Sarvam STT error: %s", payload)
                     await self.send(
                         {
                             "type": "error",
