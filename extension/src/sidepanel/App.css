@@ -1,0 +1,63 @@
+:root {
+  color: #edf0f7;
+  background: #15171d;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button {
+  border: 0;
+  border-radius: 8px;
+  padding: 0.65rem 0.9rem;
+  color: #101217;
+  background: #a8c7fa;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #c4d7ff;
+}
+
+.app {
+  padding: 1.25rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.subtitle {
+  margin: 0.35rem 0 1.25rem;
+  color: #b9c0cf;
+}
+
+.result {
+  margin-top: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.result p {
+  margin: 0.65rem 0;
+}
+
+.result strong {
+  display: block;
+  margin-bottom: 0.2rem;
+  color: #b9c0cf;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+}
+
+.error {
+  color: #ffb4ab;
+}
