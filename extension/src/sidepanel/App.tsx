@@ -18,10 +18,17 @@ import type {
   SwaraMessage,
 } from '../types';
 
-type ConversationItem =
-  | { id: string; kind: 'user' | 'agent'; text: string }
-  | { id: string; kind: 'actions'; actions: Action[]; results?: ActionResult[] }
-  | { id: string; kind: 'memory'; updates: MemoryUpdate[] };
+/**
+ * The panel shows only what Swara changed on the page. The conversation itself
+ * is spoken, so transcribing it here would just be noise beside the voice; what
+ * the user cannot verify by ear is which fields moved.
+ */
+type ConversationItem = {
+  id: string;
+  kind: 'actions';
+  actions: Action[];
+  results?: ActionResult[];
+};
 
 type ContextPanel = { relevant: ContextUsage[]; excluded: ContextUsage[] };
 type PlaybackChunk = { data: string; mimeType: string };
@@ -390,18 +397,12 @@ function App() {
       case 'speech.end':
         return;
       case 'transcript.partial':
-        setPartialTranscript(message.text);
         return;
       case 'transcript.final':
         setPartialTranscript('');
-        if (message.text.trim()) {
-          setConversation((items) => [...items, { id: `user-${Date.now()}`, kind: 'user', text: message.text }]);
-        }
         return;
       case 'agent.text':
-        if (message.text.trim()) {
-          setConversation((items) => [...items, { id: `agent-${Date.now()}`, kind: 'agent', text: message.text }]);
-        }
+        // Spoken, not written. The panel is for verifying page changes.
         return;
       case 'agent.question':
         // The question is already inside the spoken text; rendering it again
@@ -420,12 +421,6 @@ function App() {
         void executeActions(message.actions);
         return;
       case 'memory.learned':
-        if (message.updates.length) {
-          setConversation((items) => [
-            ...items,
-            { id: `memory-${Date.now()}`, kind: 'memory', updates: message.updates },
-          ]);
-        }
         return;
       case 'context.used':
         setContext({ relevant: message.relevant, excluded: message.excluded });
@@ -566,7 +561,6 @@ function App() {
     event.preventDefault();
     const text = typedText.trim();
     if (!text || !sessionOpen) return;
-    setConversation((items) => [...items, { id: `user-${Date.now()}`, kind: 'user', text }]);
     send({ type: 'text.turn', text });
     setTypedText('');
   };
@@ -584,14 +578,13 @@ function App() {
         </div>
       </header>
 
-      <section className="conversation" aria-label="Conversation with Swara">
-        {conversation.length === 0 && !partialTranscript && (
+      <section className="conversation" aria-label="Changes Swara made to this page">
+        {conversation.length === 0 && (
           <div className="conversation-empty">
-            <p>Start a voice session and Swara will read this page, then ask where to begin.</p>
+            <p>Start a voice session and just talk. Changes Swara makes to this page will appear here for you to check.</p>
           </div>
         )}
         {conversation.map((item) => <ConversationItemView key={item.id} item={item} />)}
-        {partialTranscript && <p className="turn turn--user turn--partial">{partialTranscript}<span className="live-caret" /></p>}
         <div ref={transcriptEndRef} />
       </section>
 
@@ -664,18 +657,12 @@ function stateLabel(state: AgentState): string {
 }
 
 function ConversationItemView({ item }: { item: ConversationItem }) {
-  if (item.kind === 'actions') {
-    return (
-      <article className={`turn-artifact action-artifact${item.results ? ' action-artifact--done' : ''}`}>
-        <p>{actionSummary(item.actions, item.results)}</p>
-        {item.results && <ActionResults results={item.results} />}
-      </article>
-    );
-  }
-  if (item.kind === 'memory') {
-    return <article className="turn-artifact memory-artifact"><p>Remembered</p>{item.updates.map((update, index) => <div className="memory-update" key={`${update.key}-${index}`}><span className={`memory-badge memory-badge--${update.type}`}>{update.type}</span><span className="scope-badge">{update.scope}</span><strong>{update.key}</strong><span className="memory-value">{update.value}</span></div>)}</article>;
-  }
-  return <p className={`turn turn--${item.kind}`}>{item.text}</p>;
+  return (
+    <article className={`turn-artifact action-artifact${item.results ? ' action-artifact--done' : ''}`}>
+      <p>{actionSummary(item.actions, item.results)}</p>
+      {item.results && <ActionResults results={item.results} />}
+    </article>
+  );
 }
 
 function ActionResults({ results }: { results: ActionResult[] }) {
