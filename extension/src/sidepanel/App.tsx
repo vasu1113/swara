@@ -65,6 +65,25 @@ async function sendToActiveTab(message: SwaraMessage): Promise<unknown> {
   });
 }
 
+/**
+ * Opens the permission page in a tab.
+ *
+ * `chrome.runtime.openOptionsPage()` is the idiomatic call but fails silently
+ * from a side panel, so open the URL directly and surface anything that goes
+ * wrong rather than leaving a dead button.
+ */
+async function openPermissionPage(): Promise<string | null> {
+  const url = chrome.runtime.getURL('src/permission/index.html');
+  try {
+    await chrome.tabs.create({ url });
+    return null;
+  } catch (error) {
+    return error instanceof Error
+      ? error.message
+      : `Could not open ${url}. Paste it into a new tab to grant access.`;
+  }
+}
+
 function App() {
   const [sessionId] = useState(makeSessionId);
   const [health, setHealth] = useState<HealthStatus>('checking');
@@ -393,7 +412,11 @@ function App() {
               <button
                 type="button"
                 className="button button--secondary voice-permission"
-                onClick={() => chrome.runtime.openOptionsPage()}
+                onClick={() => {
+                  void openPermissionPage().then((failure) => {
+                    if (failure) setVoiceError(failure);
+                  });
+                }}
               >
                 Grant microphone access
               </button>
