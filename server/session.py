@@ -352,25 +352,32 @@ class _STTBridge:
 
 
 class _TTSBridge:
-    """Stream one utterance through Sarvam TTS without blocking asyncio."""
+    """Stream a turn's speech through ONE Sarvam TTS connection.
+
+    Sentences are pushed in as the model writes them and synthesised over a
+    single socket. Opening a connection per sentence looks equivalent but is
+    not: each connect costs seconds, and a multi-sentence reply spent longer
+    negotiating sockets than speaking.
+    """
 
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        text: str,
         language: str,
+        text: str | None = None,
     ) -> None:
         self.events: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         self._loop = loop
-        self._text = text
         self._language = language
+        self._pending: queue.Queue[str | None] = queue.Queue()
         self._interrupted = threading.Event()
         self._socket: Any = None
         self._thread = threading.Thread(
-            target=self._run,
-            name="swara-sarvam-tts",
-            daemon=True,
+            target=self._run, name="swara-sarvam-tts", daemon=True
         )
+        if text:
+            self.push(text)
+            self.finish()
 
     @property
     def interrupted(self) -> bool:
@@ -379,9 +386,19 @@ class _TTSBridge:
     def start(self) -> None:
         self._thread.start()
 
+    def push(self, text: str) -> None:
+        """Queue another sentence onto the open connection."""
+        if text.strip() and not self._interrupted.is_set():
+            self._pending.put(text)
+
+    def finish(self) -> None:
+        """No more sentences; flush and let the socket complete."""
+        self._pending.put(None)
+
     def interrupt(self) -> None:
         """Suppress queued audio now and close the blocking socket in parallel."""
         self._interrupted.set()
+        self._pending.put(None)
         socket = self._socket
         if socket is not None:
             threading.Thread(
@@ -395,9 +412,41 @@ class _TTSBridge:
         if kind == "audio" and self._interrupted.is_set():
             return
         with suppress(RuntimeError):
-            self._loop.call_soon_threadsafe(
-                self.events.put_nowait, (kind, payload)
-            )
+            self._loop.call_soon_threadsafe(self.events.put_nowait, (kind, payload))
+
+    def _read(self, socket: Any) -> None:
+        try:
+            for response in socket:
+                if self._interrupted.is_set():
+                    break
+                response_type = str(_field(response, "type", ""))
+                data = _field(response, "data")
+                if response_type == "audio":
+                    audio = _field(data, "audio")
+                    mime_type = _field(data, "content_type", TTS_MIME_TYPE)
+                    if isinstance(audio, str) and audio:
+                        self._publish(
+                            "audio",
+                            {
+                                "data": audio,
+                                "mimeType": (
+                                    mime_type
+                                    if isinstance(mime_type, str)
+                                    else TTS_MIME_TYPE
+                                ),
+                            },
+                        )
+                elif response_type == "event":
+                    if _field(data, "event_type") == "final":
+                        break
+                elif response_type == "error":
+                    message = _field(data, "message", "Speech synthesis failed.")
+                    raise RuntimeError(str(message))
+        except Exception as exc:
+            if not self._interrupted.is_set():
+                self._publish("error", str(exc))
+        finally:
+            self._publish("done")
 
     def _run(self) -> None:
         try:
@@ -413,40 +462,24 @@ class _TTSBridge:
                     target_language_code=self._language,
                     speaker=TTS_SPEAKER,
                 )
-                socket.convert(self._text)
-                socket.flush()
+                reader = threading.Thread(
+                    target=self._read, args=(socket,),
+                    name="swara-sarvam-tts-reader", daemon=True,
+                )
+                reader.start()
 
-                for response in socket:
-                    if self._interrupted.is_set():
+                while True:
+                    text = self._pending.get()
+                    if text is None or self._interrupted.is_set():
                         break
-                    response_type = str(_field(response, "type", ""))
-                    data = _field(response, "data")
-                    if response_type == "audio":
-                        audio = _field(data, "audio")
-                        mime_type = _field(data, "content_type", TTS_MIME_TYPE)
-                        if isinstance(audio, str) and audio:
-                            self._publish(
-                                "audio",
-                                {
-                                    "data": audio,
-                                    "mimeType": (
-                                        mime_type
-                                        if isinstance(mime_type, str)
-                                        else TTS_MIME_TYPE
-                                    ),
-                                },
-                            )
-                    elif response_type == "event":
-                        if _field(data, "event_type") == "final":
-                            break
-                    elif response_type == "error":
-                        message = _field(data, "message", "Speech synthesis failed.")
-                        raise RuntimeError(str(message))
+                    socket.convert(text)
+                with suppress(Exception):
+                    socket.flush()
+                reader.join(timeout=30)
         except Exception as exc:
             if not self._interrupted.is_set():
                 self._publish("error", str(exc))
-        finally:
-            self._publish("done")
+                self._publish("done")
 
 
 def _target_language(language: str | None, text: str) -> str:
@@ -694,14 +727,46 @@ class _LiveSession:
             if opening
             else build_turn_prompt(page, context_items, history_for_prompt, utterance or "")
         )
-        bridge = _LLMStreamBridge(asyncio.get_running_loop(), prompt)
-        bridge.start()
+        loop = asyncio.get_running_loop()
+        llm = _LLMStreamBridge(loop, prompt)
+        llm.start()
+
+        # One TTS connection for the whole turn; sentences are pushed in as
+        # they are written.
+        tts = _TTSBridge(loop, _target_language(self.last_language, ""))
+        self.active_tts = tts
+        tts.start()
 
         said: list[str] = []
         spoke_any = False
+        pump: asyncio.Task[None] | None = None
+
+        async def pump_audio() -> None:
+            while True:
+                kind, payload = await tts.events.get()
+                if kind == "done":
+                    return
+                if kind == "error":
+                    await self.send(
+                        {
+                            "type": "error",
+                            "message": f"Speech synthesis failed: {payload}",
+                            "fatal": False,
+                        }
+                    )
+                    return
+                if kind == "audio" and generation == self.generation and not tts.interrupted:
+                    await self.send(
+                        {
+                            "type": "agent.audio",
+                            "data": payload["data"],
+                            "mimeType": payload["mimeType"],
+                        }
+                    )
+
         try:
             while True:
-                kind, payload = await bridge.events.get()
+                kind, payload = await llm.events.get()
                 if kind == "done":
                     break
                 if kind == "error":
@@ -714,19 +779,22 @@ class _LiveSession:
 
                 sentence = str(payload)
                 said.append(sentence)
-                # Emit the words before the audio so the transcript leads the
-                # voice rather than lagging behind it.
+                # Words before audio, so the transcript leads the voice.
                 await self.send({"type": "agent.text", "text": sentence})
                 if not spoke_any:
                     await self.send({"type": "state", "state": "speaking"})
+                    pump = asyncio.create_task(pump_audio())
                     spoke_any = True
-                await self._speak_sentence(
-                    generation, sentence, _target_language(self.last_language, sentence)
-                )
-                if generation != self.generation:
-                    break
+                tts.push(sentence)
         finally:
-            bridge.stop()
+            llm.stop()
+            tts.finish()
+            if pump is not None:
+                with suppress(asyncio.CancelledError):
+                    await pump
+            tts.interrupt()
+            if self.active_tts is tts:
+                self.active_tts = None
             if generation == self.generation and spoke_any:
                 await self.send({"type": "agent.audio.end"})
 
