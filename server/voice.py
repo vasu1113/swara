@@ -139,6 +139,17 @@ def _join_wav_chunks(chunks: list[bytes]) -> bytes:
     return bytes(combined)
 
 
+def _sarvam_content_type(content_type: str | None) -> str:
+    """Reduce a browser MIME type to the bare type Sarvam will accept.
+
+    MediaRecorder reports `audio/webm;codecs=opus`, but Sarvam matches its
+    allowlist against the exact string and rejects anything carrying
+    parameters. The base type is on the list, so drop the parameters.
+    """
+    base = (content_type or "").split(";", 1)[0].strip().lower()
+    return base or "application/octet-stream"
+
+
 @router.post("/stt", response_model=TranscriptResponse)
 async def speech_to_text(
     file: UploadFile = File(...),
@@ -154,7 +165,7 @@ async def speech_to_text(
         upload = (
             file.filename or "audio",
             content,
-            file.content_type or "application/octet-stream",
+            _sarvam_content_type(file.content_type),
         )
         try:
             response = sarvam.speech_to_text.transcribe(
