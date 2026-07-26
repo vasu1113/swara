@@ -10,6 +10,7 @@ import queue
 import unittest
 from contextlib import contextmanager
 from typing import Any
+import asyncio
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -138,6 +139,28 @@ class FakeSarvam:
         self.text_to_speech_streaming = FakeTTSStreaming(self)
 
 
+
+class FakeLLMStreamBridge:
+    """Stand in for the streaming Gemini call.
+
+    The streaming pass speaks; the structured pass (fake_run_turn) decides what
+    changes. Both must be faked or the test reaches the network.
+    """
+
+    def __init__(self, loop: Any, prompt: str) -> None:
+        self._loop = loop
+        self.events: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        self._prompt = prompt
+
+    def start(self) -> None:
+        text = "Still here." if "recover" in self._prompt else "Hello there."
+        self.events.put_nowait(("sentence", text))
+        self.events.put_nowait(("done", None))
+
+    def stop(self) -> None:
+        return None
+
+
 def receive_through(websocket: Any, final_type: str) -> list[dict[str, Any]]:
     messages = []
     while True:
@@ -205,6 +228,7 @@ class LiveSessionTest(unittest.TestCase):
             patch.object(session, "_sarvam_client", return_value=fake_sarvam),
             patch.object(session, "_context_for_session", return_value=[]),
             patch.object(session, "run_turn", side_effect=fake_run_turn),
+            patch.object(session, "_LLMStreamBridge", FakeLLMStreamBridge),
             TestClient(app.app) as client,
             client.websocket_connect("/session/live") as websocket,
         ):
@@ -223,19 +247,24 @@ class LiveSessionTest(unittest.TestCase):
                 opening_types,
                 [
                     "state",
+                    # Speech streams: each sentence is emitted and spoken before
+                    # the next is written, so text and audio interleave instead
+                    # of the whole reply arriving at once.
                     "agent.text",
-                    "context.used",
-                    "state",
                     "agent.audio",
                     "agent.audio.end",
+                    # Reasoning arrives from the concurrent structured pass.
+                    "context.used",
                     "state",
                 ],
             )
             self.assertEqual(opening[-1], {"type": "state", "state": "listening"})
 
             websocket.send_json({"type": "audio.chunk", "data": "cGNt"})
-            streamed = receive_through(websocket, "agent.actions")
-            streamed.extend(receive_through(websocket, "agent.audio.end"))
+            # Speech streams first now; the concurrent structured pass emits
+            # actions once it resolves, after the audio has finished.
+            streamed = receive_through(websocket, "agent.audio.end")
+            streamed.extend(receive_through(websocket, "agent.actions"))
             streamed.extend(receive_through(websocket, "state"))
             streamed_types = [message["type"] for message in streamed]
             assert_subsequence(
@@ -246,17 +275,16 @@ class LiveSessionTest(unittest.TestCase):
                     "speech.end",
                     "transcript.final",
                     "state",
+                    # Speech streams: each sentence is emitted and spoken
+                    # before the next is written, so text and audio interleave
+                    # rather than the whole reply landing at once.
                     "agent.text",
-                    "context.used",
-                    # Actions land before speech: the page must change while
-                    # the agent talks, not seconds after it claims to have
-                    # changed it.
-                    "state",
-                    "agent.actions",
-                    "state",
                     "agent.audio",
                     "agent.audio.end",
-                    "state",
+                    # Actions and reasoning arrive from the concurrent
+                    # structured pass once it resolves.
+                    "context.used",
+                    "agent.actions",
                 ],
             )
             action_message = next(

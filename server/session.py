@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import queue
 import threading
 from contextlib import suppress
@@ -133,6 +134,89 @@ def run_turn(
     for update in result.memory_updates:
         apply_memory_update(update, session_id=session_id)
     return result
+
+
+
+SPEECH_ONLY_SUFFIX = """
+
+## This channel is speech only
+
+Return only the words to say aloud. No JSON, no field names, no lists of
+actions. A separate pass handles what changes on the page, so describe what you
+are doing in natural speech and nothing more."""
+
+# Sentence ends, including the Devanagari danda so Hindi splits correctly.
+_SENTENCE_END = re.compile(r"(?<=[.!?।])\s+")
+
+
+class _LLMStreamBridge:
+    """Stream Gemini's spoken reply sentence by sentence.
+
+    Waiting for a complete response before speaking costs a second or more of
+    dead air on every turn, which is most of what makes a voice agent feel
+    slow. Sentences are emitted as they finish so synthesis can start on the
+    first one while the rest is still being written.
+    """
+
+    def __init__(self, loop, prompt: str) -> None:
+        self._loop = loop
+        self._prompt = prompt
+        self.events: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="swara-llm-stream", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopped.set()
+
+    def _publish(self, kind: str, payload: Any = None) -> None:
+        with suppress(RuntimeError):
+            self._loop.call_soon_threadsafe(self.events.put_nowait, (kind, payload))
+
+    def _run(self) -> None:
+        try:
+            from google import genai
+            from google.genai import types
+
+            client = genai.Client(api_key=require("GOOGLE_API_KEY"))
+            stream = client.models.generate_content_stream(
+                model=SESSION_MODEL,
+                contents=self._prompt + SPEECH_ONLY_SUFFIX,
+                config=types.GenerateContentConfig(
+                    system_instruction=SESSION_PERSONA,
+                    http_options=types.HttpOptions(
+                        retry_options=types.HttpRetryOptions(attempts=1)
+                    ),
+                ),
+            )
+            buffer = ""
+            for chunk in stream:
+                if self._stopped.is_set():
+                    break
+                buffer += getattr(chunk, "text", "") or ""
+                parts = _SENTENCE_END.split(buffer)
+                # The trailing fragment may still be mid-sentence, so hold it.
+                for sentence in parts[:-1]:
+                    if sentence.strip():
+                        self._publish("sentence", sentence.strip())
+                buffer = parts[-1]
+            if buffer.strip() and not self._stopped.is_set():
+                self._publish("sentence", buffer.strip())
+        except Exception as exc:
+            if "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc):
+                self._publish(
+                    "error",
+                    f"The {SESSION_MODEL} quota is exhausted. Enable billing on "
+                    "the Google API key.",
+                )
+            else:
+                self._publish("error", str(exc))
+        finally:
+            self._publish("done")
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -476,22 +560,51 @@ class _LiveSession:
             page = self.page
             context_items = list(self.context_items)
             await self.send({"type": "state", "state": "thinking"})
-            result = await asyncio.to_thread(
-                run_turn,
-                session_id=self.session_id,
+
+            # Two calls run at once. The streaming one starts speaking on its
+            # first finished sentence, so audio begins in well under a second
+            # instead of after the whole reply exists. The structured one
+            # decides what changes on the page and lands whenever it is ready,
+            # typically while the agent is still talking.
+            structured = asyncio.create_task(
+                asyncio.to_thread(
+                    run_turn,
+                    session_id=self.session_id,
+                    page=page,
+                    context_items=context_items,
+                    history=history_for_prompt,
+                    utterance=utterance,
+                    opening=opening,
+                )
+            )
+            spoken = await self._stream_speech(
+                generation=generation,
                 page=page,
                 context_items=context_items,
-                history=history_for_prompt,
+                history_for_prompt=history_for_prompt,
                 utterance=utterance,
                 opening=opening,
             )
+
+            try:
+                result = await structured
+            except Exception:
+                structured.cancel()
+                raise
             if generation != self.generation:
                 return
+            # The spoken words are what the user actually heard, so they are
+            # what goes into history and onto the transcript.
+            if spoken:
+                result.speech = spoken
 
             self.history.append(
                 Turn(role="agent", text=result.speech, actions=result.actions)
             )
-            await self.send({"type": "agent.text", "text": result.speech})
+            # The streaming pass already emitted each sentence; resending the
+            # whole reply here would show it twice.
+            if not spoken:
+                await self.send({"type": "agent.text", "text": result.speech})
             await self.send(
                 {
                     "type": "context.used",
@@ -548,13 +661,6 @@ class _LiveSession:
                     }
                 )
 
-            await self._speak(
-                generation,
-                result.speech,
-                _target_language(self.last_language, result.speech),
-            )
-            if generation != self.generation:
-                return
             await self.send(
                 {
                     "type": "state",
@@ -571,6 +677,100 @@ class _LiveSession:
                     {"type": "error", "message": str(exc), "fatal": False}
                 )
                 await self.send({"type": "state", "state": "listening"})
+
+    async def _stream_speech(
+        self,
+        *,
+        generation: int,
+        page: PageContext,
+        context_items: list[ContextItem],
+        history_for_prompt: list[Turn],
+        utterance: str | None,
+        opening: bool,
+    ) -> str:
+        """Speak Gemini's reply as it is written, returning what was said."""
+        prompt = (
+            build_opening_prompt(page, context_items)
+            if opening
+            else build_turn_prompt(page, context_items, history_for_prompt, utterance or "")
+        )
+        bridge = _LLMStreamBridge(asyncio.get_running_loop(), prompt)
+        bridge.start()
+
+        said: list[str] = []
+        spoke_any = False
+        try:
+            while True:
+                kind, payload = await bridge.events.get()
+                if kind == "done":
+                    break
+                if kind == "error":
+                    await self.send(
+                        {"type": "error", "message": str(payload), "fatal": False}
+                    )
+                    break
+                if kind != "sentence" or generation != self.generation:
+                    continue
+
+                sentence = str(payload)
+                said.append(sentence)
+                # Emit the words before the audio so the transcript leads the
+                # voice rather than lagging behind it.
+                await self.send({"type": "agent.text", "text": sentence})
+                if not spoke_any:
+                    await self.send({"type": "state", "state": "speaking"})
+                    spoke_any = True
+                await self._speak_sentence(
+                    generation, sentence, _target_language(self.last_language, sentence)
+                )
+                if generation != self.generation:
+                    break
+        finally:
+            bridge.stop()
+            if generation == self.generation and spoke_any:
+                await self.send({"type": "agent.audio.end"})
+
+        return " ".join(said)
+
+    async def _speak_sentence(
+        self, generation: int, text: str, language: str
+    ) -> None:
+        """Synthesise one sentence, streaming its audio out as it arrives."""
+        if not text.strip():
+            return
+        bridge = _TTSBridge(asyncio.get_running_loop(), text, language)
+        self.active_tts = bridge
+        bridge.start()
+        try:
+            while True:
+                kind, payload = await bridge.events.get()
+                if kind == "done":
+                    break
+                if kind == "error":
+                    await self.send(
+                        {
+                            "type": "error",
+                            "message": f"Speech synthesis failed: {payload}",
+                            "fatal": False,
+                        }
+                    )
+                    break
+                if (
+                    kind == "audio"
+                    and generation == self.generation
+                    and not bridge.interrupted
+                ):
+                    await self.send(
+                        {
+                            "type": "agent.audio",
+                            "data": payload["data"],
+                            "mimeType": payload["mimeType"],
+                        }
+                    )
+        finally:
+            bridge.interrupt()
+            if self.active_tts is bridge:
+                self.active_tts = None
 
     async def _speak(
         self,

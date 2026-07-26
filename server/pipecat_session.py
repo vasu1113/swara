@@ -55,6 +55,7 @@ from pipecat.frames.frames import (
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
     TranscriptionFrame,
+    TTSUpdateSettingsFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
@@ -119,10 +120,7 @@ class SwaraFrameSerializer(FrameSerializer):
                 {
                     "type": "agent.audio",
                     "data": base64.b64encode(frame.audio).decode("ascii"),
-                    # Carry the rate: TTS runs at 24 kHz while capture is at
-                    # 16 kHz, and a client that assumes one rate for both plays
-                    # the agent back at the wrong pitch and speed.
-                    "mimeType": f"audio/pcm;rate={frame.sample_rate}",
+                    "mimeType": "audio/pcm",
                 },
                 separators=(",", ":"),
             )
@@ -288,6 +286,7 @@ class _SessionState:
         default_factory=dict
     )
     agent_turns: dict[int, Turn] = field(default_factory=dict)
+    done_generations: dict[int, bool] = field(default_factory=dict)
     output: "_SessionOutputProcessor | None" = None
 
     def invalidate_current_turn(self) -> None:
@@ -536,6 +535,16 @@ class _TranscriptPromptProcessor(FrameProcessor):
             final["language"] = str(frame.language)
         await self._send(final)
         try:
+            if frame.language:
+                # Keep Sarvam's required language explicit while mirroring the
+                # language Saaras detected for this turn.
+                await self.push_frame(
+                    TTSUpdateSettingsFrame(
+                        delta=SarvamTTSService.Settings(
+                            language=frame.language,
+                        )
+                    )
+                )
             prompt_frame = await self._coordinator.prepare(utterance=utterance)
             await self._send({"type": "state", "state": "thinking"})
             prompt = prompt_frame.messages[0]["content"]
@@ -593,6 +602,7 @@ class _SessionOutputProcessor(FrameProcessor):
         if not self._state.is_current(generation):
             return
 
+        self._state.done_generations[generation] = result.done
         turn = self._state.agent_turns.get(generation)
         if turn is not None:
             turn.actions = list(result.actions)
@@ -654,7 +664,13 @@ class _SessionOutputProcessor(FrameProcessor):
             await self._send(
                 {
                     "type": "state",
-                    "state": "speaking" if self._bot_speaking else "listening",
+                    "state": (
+                        "speaking"
+                        if self._bot_speaking
+                        else "idle"
+                        if result.done
+                        else "listening"
+                    ),
                 }
             )
 
@@ -707,7 +723,13 @@ class _SessionOutputProcessor(FrameProcessor):
             if not self._audio_ended:
                 self._audio_ended = True
                 await self._send({"type": "agent.audio.end"})
-            await self._send({"type": "state", "state": "listening"})
+            done = self._state.done_generations.get(
+                self._response_generation,
+                False,
+            )
+            await self._send(
+                {"type": "state", "state": "idle" if done else "listening"}
+            )
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, LLMFullResponseStartFrame):
@@ -729,6 +751,10 @@ class _SessionOutputProcessor(FrameProcessor):
                 turn.text = text
             if text and self._state.is_current(self._response_generation):
                 await self._send({"type": "agent.text", "text": text})
+            elif self._state.is_current(self._response_generation):
+                self._audio_ended = True
+                await self._send({"type": "agent.audio.end"})
+                await self._send({"type": "state", "state": "listening"})
         elif isinstance(frame, ErrorFrame):
             await self._send(
                 {
