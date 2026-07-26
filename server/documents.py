@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
-import os
+import time
+import urllib.request
+import zipfile
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Any
 from uuid import uuid4
 
@@ -21,6 +23,11 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 ALLOWED_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".zip"}
 MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
 OCR_CHUNK_SIZE = 3_000
+OCR_LANGUAGE = "en-IN"
+OCR_POLL_SECONDS = 3
+OCR_TIMEOUT_SECONDS = 180
+# States Sarvam reports while the job is still in flight.
+OCR_PENDING_STATES = {"Accepted", "Pending", "Running"}
 
 
 def _supabase_client() -> Any:
@@ -44,52 +51,106 @@ def _serialise_response(response: Any) -> dict[str, Any]:
     return json.loads(json.dumps(data, default=str))
 
 
-def _ocr_blocks(response: Any) -> list[tuple[str, str]]:
-    blocks: list[tuple[str, str]] = []
-    for page in getattr(response, "pages", []) or []:
-        for block in getattr(page, "blocks", []) or []:
-            text = str(getattr(block, "text", "") or "").strip()
-            if text:
-                blocks.append((str(getattr(block, "layout_tag", "text") or "text"), text))
-    return blocks
+def _run_sarvam_ocr(content: bytes, filename: str) -> tuple[dict[str, Any], str]:
+    """Digitise a document with Sarvam and return (job metadata, markdown).
+
+    Sarvam's Document Intelligence is an asynchronous job, not a single call:
+    initialise, fetch a presigned upload URL, PUT the bytes to Azure blob
+    storage, start the job, poll until it leaves a running state, then download
+    a zip of the outputs. The markdown lives in `document.md` inside that zip.
+    """
+    try:
+        from sarvamai import SarvamAI
+    except ImportError as exc:
+        raise RuntimeError("Sarvam SDK is unavailable. Install server/requirements.txt.") from exc
+
+    client = SarvamAI(api_subscription_key=require("SARVAM_API_KEY"))
+    intelligence = client.document_intelligence
+
+    job = intelligence.initialise(
+        job_parameters={"language": OCR_LANGUAGE, "output_format": "md"}
+    )
+    job_id = job.job_id
+
+    # Sarvam keys the upload map by the name we hand it, so keep it simple and
+    # predictable rather than passing through a user-supplied filename.
+    upload_name = f"document{Path(filename).suffix.lower() or '.pdf'}"
+    links = intelligence.get_upload_links(job_id=job_id, files=[upload_name])
+    upload_url = links.upload_urls[upload_name].file_url
+
+    # Azure block blobs reject a PUT without this header.
+    request = urllib.request.Request(
+        upload_url,
+        data=content,
+        method="PUT",
+        headers={"x-ms-blob-type": "BlockBlob"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        if response.status not in (200, 201):
+            raise RuntimeError(f"Upload to Sarvam storage failed with status {response.status}.")
+
+    intelligence.start(job_id)
+
+    deadline = time.monotonic() + OCR_TIMEOUT_SECONDS
+    while True:
+        status = intelligence.get_status(job_id)
+        if status.job_state not in OCR_PENDING_STATES:
+            break
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"Sarvam OCR did not finish within {OCR_TIMEOUT_SECONDS}s (state: {status.job_state})."
+            )
+        time.sleep(OCR_POLL_SECONDS)
+
+    if status.job_state != "Completed":
+        detail = getattr(status, "error_message", None) or status.job_state
+        raise RuntimeError(f"Sarvam OCR failed: {detail}")
+
+    downloads = intelligence.get_download_links(job_id)
+    if not downloads.download_urls:
+        raise RuntimeError("Sarvam returned no output files.")
+
+    archive_url = next(iter(downloads.download_urls.values())).file_url
+    with urllib.request.urlopen(archive_url, timeout=120) as response:
+        archive_bytes = response.read()
+
+    markdown = ""
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        names = archive.namelist()
+        for name in names:
+            if name.lower().endswith(".md"):
+                markdown = archive.read(name).decode("utf-8", "replace")
+                break
+
+    if not markdown.strip():
+        raise RuntimeError("Sarvam produced no readable text for this document.")
+
+    return _serialise_response(downloads), markdown
 
 
-def _chunk_blocks(blocks: list[tuple[str, str]]) -> list[str]:
-    """Group OCR blocks into logical, bounded Markdown context entries."""
-    chunks: list[str] = []
-    current: list[str] = []
-    current_length = 0
+def _markdown_sections(markdown: str) -> list[tuple[str, str]]:
+    """Split OCR markdown into (heading, body) sections.
 
-    def flush() -> None:
-        nonlocal current, current_length
-        if current:
-            chunks.append("\n\n".join(current))
-        current = []
-        current_length = 0
+    Resumes and forms are heading-structured, so sections map cleanly onto
+    retrievable vault rows: "WORK EXPERIENCE", "EDUCATION", and so on.
+    """
+    sections: list[tuple[str, str]] = []
+    heading = "Document"
+    body: list[str] = []
 
-    for layout_tag, text in blocks:
-        is_heading = "heading" in layout_tag.lower() or "title" in layout_tag.lower()
-        block_markdown = f"<!-- {layout_tag} -->\n{text}"
-        if current and (is_heading or current_length + len(block_markdown) > OCR_CHUNK_SIZE):
-            flush()
+    for line in markdown.splitlines():
+        if line.lstrip().startswith("#"):
+            if any(part.strip() for part in body):
+                sections.append((heading, "\n".join(body).strip()))
+            heading = line.lstrip("#").strip() or "Document"
+            body = []
+        else:
+            body.append(line)
 
-        # A very large OCR block is split by paragraphs, rather than becoming a
-        # single unusable vault row.
-        paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()] or [text]
-        for paragraph in paragraphs:
-            paragraph_markdown = f"<!-- {layout_tag} -->\n{paragraph}"
-            if current and current_length + len(paragraph_markdown) > OCR_CHUNK_SIZE:
-                flush()
-            if len(paragraph_markdown) > OCR_CHUNK_SIZE:
-                for start in range(0, len(paragraph_markdown), OCR_CHUNK_SIZE):
-                    if current:
-                        flush()
-                    chunks.append(paragraph_markdown[start : start + OCR_CHUNK_SIZE])
-            else:
-                current.append(paragraph_markdown)
-                current_length += len(paragraph_markdown) + 2
-    flush()
-    return chunks
+    if any(part.strip() for part in body):
+        sections.append((heading, "\n".join(body).strip()))
+
+    return [(name, text) for name, text in sections if text]
 
 
 def _set_document_status(client: Any, document_id: str, status: str, **values: Any) -> None:
@@ -131,43 +192,30 @@ async def upload_document(file: UploadFile) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not store document: {exc}") from exc
 
-    temporary_path = ""
     try:
-        try:
-            from sarvamai import SarvamAI
-        except ImportError as exc:
-            raise RuntimeError("Sarvam SDK is unavailable. Install server/requirements.txt.") from exc
-
-        with NamedTemporaryFile(suffix=suffix, delete=False) as temporary_file:
-            temporary_file.write(content)
-            temporary_path = temporary_file.name
-
         _set_document_status(client, document_id, "processing")
-        sarvam = SarvamAI(api_subscription_key=require("SARVAM_API_KEY"))
-        ocr_response = sarvam.document_digitization.digitize(
-            file_path=temporary_path,
-            language="en-IN",
-            output_format="md",
-        )
-        raw_output = _serialise_response(ocr_response)
-        # Preserve Sarvam's raw result even if a later context-row insertion
-        # fails, so the document can be diagnosed or reprocessed.
+        job_metadata, markdown = _run_sarvam_ocr(content, filename)
+
+        # Keep the job metadata and the full extracted text, so a document can
+        # be re-chunked later without paying for OCR again.
+        raw_output = {**job_metadata, "markdown": markdown}
         _set_document_status(client, document_id, "processing", ocr_output=raw_output, error=None)
-        chunks = _chunk_blocks(_ocr_blocks(ocr_response))
+
+        sections = _markdown_sections(markdown)
         inserted_context = [
             add_context(
                 ContextItem(
                     type="document",
-                    category="document",
-                    key=f"document:{document_id}:section:{index}",
-                    value=chunk,
+                    category=heading.lower(),
+                    key=f"document:{document_id}:{heading.lower().replace(' ', '_')}",
+                    value=body[:OCR_CHUNK_SIZE],
                     source=filename,
                     source_type="document",
                     scope="persistent",
                     document_id=document_id,
                 )
             )
-            for index, chunk in enumerate(chunks, start=1)
+            for heading, body in sections
         ]
         _set_document_status(client, document_id, "done", error=None)
         return {
@@ -191,9 +239,4 @@ async def upload_document(file: UploadFile) -> dict[str, Any]:
             pass
         raise HTTPException(status_code=502, detail=f"Document OCR failed: {exc}") from exc
     finally:
-        if temporary_path:
-            try:
-                os.unlink(temporary_path)
-            except FileNotFoundError:
-                pass
         await file.close()

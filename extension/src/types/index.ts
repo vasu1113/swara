@@ -134,6 +134,43 @@ export type PlanResponse = {
 };
 
 /* ------------------------------------------------------------------ *
+ * Voice
+ * ------------------------------------------------------------------ */
+
+/** Sarvam language codes. "unknown" lets Saarika auto-detect code-switching. */
+export type SarvamLanguage =
+  | 'unknown'
+  | 'en-IN'
+  | 'hi-IN'
+  | 'ta-IN'
+  | 'te-IN'
+  | 'kn-IN'
+  | 'ml-IN'
+  | 'mr-IN'
+  | 'bn-IN'
+  | 'gu-IN'
+  | 'pa-IN'
+  | 'od-IN';
+
+export type TranscriptResponse = {
+  transcript: string;
+  /** What Saarika reported detecting, when it says. */
+  language?: string;
+};
+
+export type SpeechRequest = {
+  text: string;
+  /** Always send one explicitly — leaving it unset skews pronunciation. */
+  language: SarvamLanguage;
+};
+
+export type SpeechResponse = {
+  /** base64-encoded audio, ready for a data: URL. */
+  audioBase64: string;
+  mimeType: string;
+};
+
+/* ------------------------------------------------------------------ *
  * Extension-internal messaging
  * ------------------------------------------------------------------ */
 

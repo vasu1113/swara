@@ -116,6 +116,33 @@ class PlanResponse(Base):
 
 
 # --------------------------------------------------------------------- #
+# Voice
+# --------------------------------------------------------------------- #
+
+SarvamLanguage = Literal[
+    "unknown",  # lets Saarika auto-detect code-switched speech
+    "en-IN", "hi-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN",
+    "mr-IN", "bn-IN", "gu-IN", "pa-IN", "od-IN",
+]
+
+
+class TranscriptResponse(Base):
+    transcript: str
+    language: str | None = None
+
+
+class SpeechRequest(Base):
+    text: str
+    # Always explicit: leaving the language unset skews Bulbul's pronunciation.
+    language: SarvamLanguage = "en-IN"
+
+
+class SpeechResponse(Base):
+    audio_base64: str
+    mime_type: str = "audio/wav"
+
+
+# --------------------------------------------------------------------- #
 # Context vault rows (mirrors the Supabase schema)
 # --------------------------------------------------------------------- #
 

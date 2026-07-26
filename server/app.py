@@ -11,6 +11,7 @@ from context_store import list_context, seed_profile
 from documents import router as documents_router
 from planner import plan
 from schemas import ContextItem, PlanRequest, PlanResponse
+from voice import router as voice_router
 
 
 app = FastAPI(title="Swara server")
@@ -58,3 +59,4 @@ def make_plan(request: PlanRequest) -> PlanResponse:
 
 
 app.include_router(documents_router)
+app.include_router(voice_router)

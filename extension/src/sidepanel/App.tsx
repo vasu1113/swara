@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { getHealth, postPlan } from './api';
+import { useEffect, useRef, useState } from 'react';
+import { getHealth, postPlan, postSpeechToText, postTextToSpeech } from './api';
 import type {
   Action,
   ActionResult,
@@ -77,6 +77,31 @@ function App() {
   const [planning, setPlanning] = useState(false);
   const [filling, setFilling] = useState(false);
   const [expandedActions, setExpandedActions] = useState<Set<number>>(new Set());
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [speaking, setSpeaking] = useState(false);
+  const [speechError, setSpeechError] = useState<string | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const shouldTranscribeRef = useRef(false);
+  const isMountedRef = useRef(true);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const stopStream = () => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  };
+
+  const clearRecordingTimer = () => {
+    if (recordingTimerRef.current !== null) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  };
 
   useEffect(() => {
     const checkHealth = async () => {
@@ -88,6 +113,18 @@ function App() {
       }
     };
     void checkHealth();
+  }, []);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      shouldTranscribeRef.current = false;
+      clearRecordingTimer();
+      const recorder = recorderRef.current;
+      if (recorder && recorder.state !== 'inactive') recorder.stop();
+      stopStream();
+    };
   }, []);
 
   const scanPage = async () => {
@@ -121,6 +158,127 @@ function App() {
       setError(planError instanceof Error ? planError.message : 'Unable to create a plan.');
     } finally {
       setPlanning(false);
+    }
+  };
+
+  const startRecording = async () => {
+    setVoiceError(null);
+    setRecordingSeconds(0);
+    let stream: MediaStream | null = null;
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!isMountedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
+      const supportedMimeType = ['audio/webm;codecs=opus', 'audio/webm'].find((mimeType) =>
+        MediaRecorder.isTypeSupported(mimeType),
+      );
+      const recorder = supportedMimeType
+        ? new MediaRecorder(stream, { mimeType: supportedMimeType })
+        : new MediaRecorder(stream);
+
+      streamRef.current = stream;
+      recorderRef.current = recorder;
+      recordingChunksRef.current = [];
+      shouldTranscribeRef.current = true;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) recordingChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        shouldTranscribeRef.current = false;
+        clearRecordingTimer();
+        stopStream();
+        if (isMountedRef.current) {
+          setRecording(false);
+          setVoiceError('Recording stopped because the microphone encountered an error. Please try again.');
+        }
+      };
+      recorder.onstop = () => {
+        clearRecordingTimer();
+        stopStream();
+        recorderRef.current = null;
+        if (isMountedRef.current) setRecording(false);
+
+        const blob = new Blob(recordingChunksRef.current, {
+          type: recorder.mimeType || supportedMimeType || 'audio/webm',
+        });
+        if (!shouldTranscribeRef.current || !blob.size || !isMountedRef.current) return;
+
+        void (async () => {
+          setTranscribing(true);
+          try {
+            const response = await postSpeechToText(blob);
+            if (!isMountedRef.current) return;
+            const transcript = response.transcript.trim();
+            if (!transcript) {
+              setVoiceError('No speech was detected. Please try again.');
+              return;
+            }
+            setInstruction((current) => (current.trim() ? `${current.trimEnd()}\n\n${transcript}` : transcript));
+            setHealth('connected');
+          } catch (transcriptionError) {
+            if (!isMountedRef.current) return;
+            setHealth('offline');
+            setVoiceError(transcriptionError instanceof Error ? transcriptionError.message : 'Unable to transcribe the recording.');
+          } finally {
+            if (isMountedRef.current) setTranscribing(false);
+          }
+        })();
+      };
+
+      recorder.start();
+      setRecording(true);
+      recordingTimerRef.current = setInterval(() => {
+        if (isMountedRef.current) setRecordingSeconds((seconds) => seconds + 1);
+      }, 1000);
+    } catch (recordingError) {
+      stream?.getTracks().forEach((track) => track.stop());
+      clearRecordingTimer();
+      stopStream();
+      const name = recordingError instanceof Error ? recordingError.name : '';
+      setVoiceError(
+        name === 'NotAllowedError'
+          ? 'Microphone access is blocked. Allow microphone access for the Swara extension, then try again.'
+          : recordingError instanceof Error
+            ? recordingError.message
+            : 'Unable to start recording. Please try again.',
+      );
+    }
+  };
+
+  const stopRecording = () => {
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state === 'inactive') return;
+    shouldTranscribeRef.current = true;
+    recorder.stop();
+    clearRecordingTimer();
+    stopStream();
+  };
+
+  const toggleRecording = () => {
+    if (recording) stopRecording();
+    else void startRecording();
+  };
+
+  const speakSummary = async () => {
+    if (!plan?.spokenSummary) return;
+    setSpeechError(null);
+    setSpeaking(true);
+    try {
+      const response = await postTextToSpeech({ text: plan.spokenSummary, language: 'unknown' });
+      const audio = audioRef.current;
+      if (!audio) throw new Error('Audio playback is not available.');
+      audio.src = `data:${response.mimeType};base64,${response.audioBase64}`;
+      await audio.play();
+      setHealth('connected');
+    } catch (speechRequestError) {
+      setHealth('offline');
+      setSpeaking(false);
+      setSpeechError(speechRequestError instanceof Error ? speechRequestError.message : 'Unable to speak the plan summary.');
     }
   };
 
@@ -193,8 +351,18 @@ function App() {
             <p className="step">02</p>
             <h2 id="instruct-heading">What should Swara do?</h2>
           </div>
-          <span className="mic-placeholder" aria-label="Voice input coming soon">Mic soon</span>
+          <button
+            className={`mic-control${recording ? ' mic-control--recording' : ''}`}
+            type="button"
+            onClick={toggleRecording}
+            disabled={transcribing}
+            aria-pressed={recording}
+          >
+            <span className="mic-icon" aria-hidden="true">●</span>
+            {transcribing ? 'Transcribing' : recording ? 'Stop' : 'Start speaking'}
+          </button>
         </div>
+        {recording && <p className="recording-status" aria-live="polite"><span className="recording-dot" />Recording · {recordingSeconds}s</p>}
         <textarea
           value={instruction}
           onChange={(event) => setInstruction(event.target.value)}
@@ -202,6 +370,7 @@ function App() {
           aria-label="Instructions for Swara"
           rows={4}
         />
+        {voiceError && <p className="voice-error" role="alert">{voiceError}</p>}
         <button className="button button--primary full-width" type="button" onClick={() => void createPlan()} disabled={!page || !instruction.trim() || planning}>
           {planning ? <><span className="spinner" />Planning</> : 'Plan'}
         </button>
@@ -216,6 +385,12 @@ function App() {
             <h2 id="preview-heading">Review the plan</h2>
           </div>
           <p className="plan-summary">{plan.actions.length} fields ready <span>·</span> {plan.relevantContext.length} pieces of context used</p>
+          <div className="speak-summary">
+            <button className="button button--secondary" type="button" onClick={() => void speakSummary()} disabled={!plan.spokenSummary || speaking}>
+              {speaking ? <><span className="spinner" />Speaking</> : 'Speak summary'}
+            </button>
+            {speechError && <p className="voice-error" role="alert">{speechError}</p>}
+          </div>
 
           {plan.status === 'needs_clarification' && (
             <section className="clarifications" aria-label="Clarifications needed">
@@ -275,6 +450,7 @@ function App() {
           <ul>{results.map((result, index) => <li className={result.ok ? 'result-ok' : 'result-error'} key={`${result.fieldId}-${index}`}><span>{result.ok ? 'OK' : 'Error'}</span><p><strong>{fieldQuestion(result.fieldId)}</strong>{result.error && <small>{result.error}</small>}</p></li>)}</ul>
         </section>
       )}
+      <audio ref={audioRef} onEnded={() => setSpeaking(false)} />
     </main>
   );
 }

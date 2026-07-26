@@ -1,4 +1,4 @@
-import type { PlanRequest, PlanResponse } from '../types';
+import type { PlanRequest, PlanResponse, SpeechRequest, SpeechResponse, TranscriptResponse } from '../types';
 
 // 8000 is a common default and was already taken on the dev machine; 8787 keeps
 // Swara out of the way of whatever else is running locally.
@@ -37,4 +37,29 @@ export async function postPlan(request: PlanRequest): Promise<PlanResponse> {
 
   if (!response.ok) throw await serverError(response);
   return (await response.json()) as PlanResponse;
+}
+
+export async function postSpeechToText(blob: Blob, language = 'unknown'): Promise<TranscriptResponse> {
+  const formData = new FormData();
+  formData.append('file', blob, 'recording.webm');
+  formData.append('language', language);
+
+  const response = await fetch(`${API_BASE_URL}/voice/stt`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!response.ok) throw await serverError(response);
+  return (await response.json()) as TranscriptResponse;
+}
+
+export async function postTextToSpeech(request: SpeechRequest): Promise<SpeechResponse> {
+  const response = await fetch(`${API_BASE_URL}/voice/tts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) throw await serverError(response);
+  return (await response.json()) as SpeechResponse;
 }
