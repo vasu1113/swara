@@ -7,6 +7,7 @@ credentials.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from config import require
@@ -73,6 +74,38 @@ def _current_persistent_item(key: str) -> ContextItem | None:
     return _to_context_item(response.data[0])
 
 
+def _live_item_containing(text: str) -> ContextItem | None:
+    """Find the live persistent row whose value contains `text`.
+
+    Corrections arrive keyed however the model chose to name the thing, which
+    rarely matches a row key we generated — a resume section is keyed
+    `document:<id>:product_growth_intern`, not `experience.company_name`. The
+    old value is the reliable handle, so we locate the row by its content.
+    """
+    response = (
+        _client()
+        .table("context_items")
+        .select("*")
+        .eq("scope", "persistent")
+        .is_("superseded_by", "null")
+        .ilike("value", f"%{text}%")
+        .execute()
+    )
+
+    # The database filter is a cheap prefilter only. It is case-insensitive and
+    # substring-based, so correcting "Lar" would otherwise match "Circular" —
+    # which is exactly what happened before this guard existed. Narrow to whole
+    # words, case-sensitively, so a correction can only hit the real token.
+    pattern = re.compile(rf"\b{re.escape(text)}\b")
+    rows = [row for row in (response.data or []) if pattern.search(row["value"])]
+    if not rows:
+        return None
+
+    # Prefer the most specific match: a short fact beats a long document
+    # section that merely happens to mention the same word.
+    return _to_context_item(min(rows, key=lambda row: len(row["value"])))
+
+
 def apply_memory_update(update: MemoryUpdate, session_id: str) -> ContextItem:
     """Persist an extracted memory update, retaining correction history."""
     if update.type == "instruction":
@@ -104,9 +137,40 @@ def apply_memory_update(update: MemoryUpdate, session_id: str) -> ContextItem:
     if update.type != "correction":
         return add_context(item)
 
+    prior = _current_persistent_item(update.key)
+
+    if prior is None and update.old_value:
+        # The model named the key its own way. Fall back to finding the row that
+        # actually contains the wrong text, and correct it *in place* rather
+        # than replacing it wholesale — superseding a whole resume section to
+        # fix one misread word would discard the dates and bullets with it.
+        target = _live_item_containing(update.old_value)
+        if target and target.id:
+            corrected = add_context(
+                target.model_copy(
+                    update={
+                        "id": None,
+                        "value": re.sub(
+                            rf"\b{re.escape(update.old_value)}\b",
+                            update.value,
+                            target.value,
+                        ),
+                        "source": update.reason,
+                        "superseded_by": None,
+                    }
+                )
+            )
+            (
+                _client()
+                .table("context_items")
+                .update({"superseded_by": corrected.id})
+                .eq("id", target.id)
+                .execute()
+            )
+            return corrected
+
     # Insert first to obtain the replacement id, then point the prior live row
     # at it. The old row remains queryable with include_superseded=True.
-    prior = _current_persistent_item(update.key)
     corrected = add_context(item.model_copy(update={"scope": "persistent"}))
     if prior and prior.id:
         (
