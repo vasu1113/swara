@@ -45,6 +45,11 @@ VAD_SETTINGS = {
     # Speech must be clearly present before a turn starts, so breaths and room
     # noise do not open one.
     "min_speech_frames": "10",
+    # How confident the detector must be that a frame is speech. The default is
+    # permissive enough that keyboard noise and background conversation open
+    # turns, which the recogniser then dutifully transcribes as nonsense.
+    "positive_speech_threshold": "0.6",
+    "negative_speech_threshold": "0.4",
     # Silence required before a turn is considered finished. This is the single
     # most important value here: it is the pause you are allowed to take
     # mid-sentence without being cut off.

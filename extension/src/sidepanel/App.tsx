@@ -387,13 +387,30 @@ function App() {
   };
 
   const startCapture = async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // Without echo cancellation the microphone hears the agent's own
+        // speech and transcribes it as the user talking, so the agent
+        // interrupts and answers itself. The other two keep room noise and
+        // distance from being heard as words.
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+        sampleRate: AUDIO_SAMPLE_RATE,
+      },
+    });
     if (!mountedRef.current) {
       stream.getTracks().forEach((track) => track.stop());
       return;
     }
 
-    const audioContext = new AudioContext();
+    // Ask the browser for 16 kHz directly. Chrome resamples the microphone with
+    // a proper anti-aliasing filter; doing it ourselves by interpolating
+    // between samples folds everything above 8 kHz back into the speech band as
+    // noise, which is heard by the recogniser as garbled consonants and
+    // phantom words.
+    const audioContext = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
     try {
       await audioContext.audioWorklet.addModule(new URL('./worklet.ts', import.meta.url));
       const source = audioContext.createMediaStreamSource(stream);
