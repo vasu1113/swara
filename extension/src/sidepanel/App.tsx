@@ -73,6 +73,7 @@ function App() {
   const [plan, setPlan] = useState<PlanResponse | null>(null);
   const [results, setResults] = useState<ActionResult[] | null>(null);
   const [memorySaved, setMemorySaved] = useState<number | null>(null);
+  const [needsMicPermission, setNeedsMicPermission] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [planning, setPlanning] = useState(false);
@@ -241,9 +242,11 @@ function App() {
       clearRecordingTimer();
       stopStream();
       const name = recordingError instanceof Error ? recordingError.name : '';
+      const blocked = name === 'NotAllowedError' || name === 'SecurityError';
+      setNeedsMicPermission(blocked);
       setVoiceError(
-        name === 'NotAllowedError'
-          ? 'Microphone access is blocked. Allow microphone access for the Swara extension, then try again.'
+        blocked
+          ? 'Chrome will not ask for microphone access from inside a side panel.'
           : recordingError instanceof Error
             ? recordingError.message
             : 'Unable to start recording. Please try again.',
@@ -383,7 +386,20 @@ function App() {
           aria-label="Instructions for Swara"
           rows={4}
         />
-        {voiceError && <p className="voice-error" role="alert">{voiceError}</p>}
+        {voiceError && (
+          <p className="voice-error" role="alert">
+            {voiceError}
+            {needsMicPermission && (
+              <button
+                type="button"
+                className="button button--secondary voice-permission"
+                onClick={() => chrome.runtime.openOptionsPage()}
+              >
+                Grant microphone access
+              </button>
+            )}
+          </p>
+        )}
         <button className="button button--primary full-width" type="button" onClick={() => void createPlan()} disabled={!page || !instruction.trim() || planning}>
           {planning ? <><span className="spinner" />Planning</> : 'Plan'}
         </button>

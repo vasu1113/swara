@@ -20,6 +20,9 @@ export default defineManifest({
   side_panel: {
     default_path: 'src/sidepanel/index.html',
   },
+  // Chrome refuses to show the getUserMedia prompt inside a side panel, so the
+  // panel sends the user to this page to grant it once for the extension origin.
+  options_page: 'src/permission/index.html',
   action: {
     default_title: 'Open Swara',
   },
