@@ -131,6 +131,21 @@ def run_turn(
             ) from exc
         raise
     result = TurnResult.model_validate_json(response.text or "")
+
+    # Drop actions naming ids the page never offered. Models will invent a
+    # plausible id for a question they can see but have no handle on — a
+    # Google Form's radio groups, for instance, are div[role=radio] and were
+    # invisible to the extractor. Executing those does nothing while the agent
+    # cheerfully reports success, so discard them before they are announced.
+    known = {field.field_id for field in page.fields}
+    known.update(control.control_id for control in page.controls)
+    if known:
+        kept = [action for action in result.actions if action.field_id in known]
+        if len(kept) != len(result.actions):
+            dropped = [a.field_id for a in result.actions if a.field_id not in known]
+            logger.warning("Dropped actions for unknown fields: %s", dropped)
+            result.actions = kept
+
     for update in result.memory_updates:
         apply_memory_update(update, session_id=session_id)
     return result
