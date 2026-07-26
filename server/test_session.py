@@ -234,8 +234,8 @@ class LiveSessionTest(unittest.TestCase):
             self.assertEqual(opening[-1], {"type": "state", "state": "listening"})
 
             websocket.send_json({"type": "audio.chunk", "data": "cGNt"})
-            streamed = receive_through(websocket, "agent.audio.end")
-            streamed.extend(receive_through(websocket, "agent.actions"))
+            streamed = receive_through(websocket, "agent.actions")
+            streamed.extend(receive_through(websocket, "agent.audio.end"))
             streamed.extend(receive_through(websocket, "state"))
             streamed_types = [message["type"] for message in streamed]
             assert_subsequence(
@@ -248,11 +248,14 @@ class LiveSessionTest(unittest.TestCase):
                     "state",
                     "agent.text",
                     "context.used",
+                    # Actions land before speech: the page must change while
+                    # the agent talks, not seconds after it claims to have
+                    # changed it.
+                    "state",
+                    "agent.actions",
                     "state",
                     "agent.audio",
                     "agent.audio.end",
-                    "state",
-                    "agent.actions",
                     "state",
                 ],
             )

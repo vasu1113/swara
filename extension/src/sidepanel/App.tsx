@@ -26,6 +26,13 @@ type ConversationItem =
 type ContextPanel = { relevant: ContextUsage[]; excluded: ContextUsage[] };
 type PlaybackChunk = { data: string; mimeType: string };
 
+const MP3_MIME = 'audio/mpeg';
+
+/** Swallow the DOM exceptions MediaSource throws on races we can't prevent. */
+function with_suppress(fn: () => void) {
+  try { fn(); } catch { /* stream already torn down */ }
+}
+
 const makeSessionId = () =>
   typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
@@ -139,6 +146,9 @@ function App() {
   const playbackRef = useRef<HTMLAudioElement | null>(null);
   const playbackUrlRef = useRef<string | null>(null);
   const playbackQueueRef = useRef<PlaybackChunk[]>([]);
+  const mediaSourceRef = useRef<MediaSource | null>(null);
+  const sourceBufferRef = useRef<SourceBuffer | null>(null);
+  const audioCompleteRef = useRef(false);
   const activeActionRef = useRef<string | null>(null);
   const startingRef = useRef(false);
   const agentStateRef = useRef<AgentState>('idle');
@@ -152,6 +162,9 @@ function App() {
 
   const stopPlayback = () => {
     playbackQueueRef.current = [];
+    sourceBufferRef.current = null;
+    mediaSourceRef.current = null;
+    audioCompleteRef.current = false;
     const audio = playbackRef.current;
     if (audio) {
       audio.onended = null;
@@ -168,45 +181,74 @@ function App() {
   };
 
   /**
-   * Plays the turn's speech as one stream.
+   * Streams the agent's speech as it arrives.
    *
-   * Sarvam streams MP3 frames, not standalone files, so playing each chunk in
-   * its own Audio element stutters: every element pays play() startup latency
-   * and a partial chunk may not decode alone. MP3 frames concatenate into a
-   * valid stream, so we join them and play once. Costs a beat before the agent
-   * starts speaking; buys speech that doesn't sound broken.
+   * Two approaches were wrong before this one. An Audio element per chunk
+   * stutters, because Sarvam sends MP3 frames rather than standalone files and
+   * each element pays play() startup latency. Buffering the whole turn plays
+   * smoothly but adds a dead pause before every reply, which is worse in
+   * conversation than a little roughness.
+   *
+   * MediaSource gives both: append frames to one buffer as they land, so audio
+   * starts on the first chunk and plays continuously.
    */
-  const playBufferedTurn = () => {
-    const chunks = playbackQueueRef.current;
-    if (playbackRef.current || chunks.length === 0) return;
-    playbackQueueRef.current = [];
-
-    const parts = chunks.map((chunk) => fromBase64(chunk.data));
-    const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
-    const joined = new Uint8Array(total);
-    let offset = 0;
-    for (const part of parts) {
-      joined.set(part, offset);
-      offset += part.byteLength;
+  const ensurePlaybackStream = () => {
+    if (mediaSourceRef.current) return;
+    if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported(MP3_MIME)) {
+      return; // falls back to buffered playback below
     }
 
-    const url = URL.createObjectURL(
-      new Blob([joined.buffer as ArrayBuffer], { type: chunks[0].mimeType }),
-    );
+    const mediaSource = new MediaSource();
+    const url = URL.createObjectURL(mediaSource);
     const audio = new Audio(url);
+    audio.autoplay = true;
+    mediaSourceRef.current = mediaSource;
     playbackRef.current = audio;
     playbackUrlRef.current = url;
-    const finish = () => {
-      if (playbackRef.current !== audio) return;
-      playbackRef.current = null;
-      if (playbackUrlRef.current === url) {
-        URL.revokeObjectURL(url);
-        playbackUrlRef.current = null;
+
+    mediaSource.addEventListener('sourceopen', () => {
+      if (mediaSourceRef.current !== mediaSource) return;
+      try {
+        const buffer = mediaSource.addSourceBuffer(MP3_MIME);
+        sourceBufferRef.current = buffer;
+        buffer.addEventListener('updateend', drainPlaybackQueue);
+        drainPlaybackQueue();
+      } catch {
+        teardownPlaybackStream();
       }
+    }, { once: true });
+
+    audio.onended = () => {
+      if (playbackRef.current !== audio) return;
+      teardownPlaybackStream();
     };
-    audio.onended = finish;
-    audio.onerror = finish;
-    void audio.play().catch(finish);
+
+    void audio.play().catch(() => undefined);
+  };
+
+  const drainPlaybackQueue = () => {
+    const buffer = sourceBufferRef.current;
+    if (!buffer || buffer.updating) return;
+    const chunk = playbackQueueRef.current.shift();
+    if (!chunk) {
+      // Only close the stream once every queued frame has been appended.
+      if (audioCompleteRef.current && mediaSourceRef.current?.readyState === 'open') {
+        with_suppress(() => mediaSourceRef.current!.endOfStream());
+      }
+      return;
+    }
+    const bytes = fromBase64(chunk.data);
+    with_suppress(() =>
+      buffer.appendBuffer(
+        bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+      ),
+    );
+  };
+
+  const teardownPlaybackStream = () => {
+    sourceBufferRef.current = null;
+    mediaSourceRef.current = null;
+    audioCompleteRef.current = false;
   };
 
   const stopCapture = () => {
@@ -294,7 +336,8 @@ function App() {
         send({ type: 'agent.interrupt' });
         return;
       case 'agent.audio.end':
-        playBufferedTurn();
+        audioCompleteRef.current = true;
+        drainPlaybackQueue();
         return;
       case 'speech.end':
         return;
@@ -308,13 +351,18 @@ function App() {
         }
         return;
       case 'agent.text':
-      case 'agent.question':
         if (message.text.trim()) {
           setConversation((items) => [...items, { id: `agent-${Date.now()}`, kind: 'agent', text: message.text }]);
         }
         return;
+      case 'agent.question':
+        // The question is already inside the spoken text; rendering it again
+        // showed every question twice.
+        return;
       case 'agent.audio':
         playbackQueueRef.current.push({ data: message.data, mimeType: message.mimeType });
+        ensurePlaybackStream();
+        drainPlaybackQueue();
         return;
       case 'agent.actions':
         void executeActions(message.actions);

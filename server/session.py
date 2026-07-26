@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
 import threading
 from contextlib import suppress
@@ -24,7 +25,6 @@ from conversation_prompts import (
     build_opening_prompt,
     build_turn_prompt,
 )
-from planner import MODEL
 from schemas import ActionResult, ContextItem, PageContext
 from session_schemas import (
     AUDIO_SAMPLE_RATE,
@@ -39,11 +39,17 @@ logger = logging.getLogger("swara.session")
 
 router = APIRouter()
 
+# Conversation is latency-bound in a way batch planning is not: one second of
+# thinking reads as responsive, three reads as broken. flash-lite answers in
+# ~1s against ~3.4s for the larger flash models, which matters more here than
+# the extra reasoning headroom. Override with SWARA_SESSION_MODEL.
+SESSION_MODEL = os.environ.get("SWARA_SESSION_MODEL", "gemini-3.1-flash-lite")
+
 STT_MODEL = "saaras:v3"
 TTS_MODEL = "bulbul:v3"
 TTS_SPEAKER = "advait"
 TTS_DEFAULT_LANGUAGE = "en-IN"
-TTS_MIME_TYPE = "audio/mp3"
+TTS_MIME_TYPE = "audio/mpeg"  # canonical; MediaSource rejects "audio/mp3"
 
 
 def _sarvam_client() -> Any:
@@ -99,15 +105,30 @@ def run_turn(
         prompt = build_turn_prompt(page, context_items, history, utterance)
 
     client = genai.Client(api_key=require("GOOGLE_API_KEY"))
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SESSION_PERSONA,
-            response_mime_type="application/json",
-            response_schema=TurnResult,
-        ),
-    )
+    try:
+        response = client.models.generate_content(
+            model=SESSION_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SESSION_PERSONA,
+                response_mime_type="application/json",
+                response_schema=TurnResult,
+                # One attempt. The default backoff silently turns an exhausted
+                # quota into seconds of dead air per turn, which is felt as the
+                # agent being slow rather than as the hard failure it is.
+                http_options=types.HttpOptions(
+                    retry_options=types.HttpRetryOptions(attempts=1)
+                ),
+            ),
+        )
+    except Exception as exc:
+        if "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc):
+            raise RuntimeError(
+                f"The {SESSION_MODEL} quota is exhausted. Enable billing on the "
+                "Google API key, or set SWARA_SESSION_MODEL to a model with "
+                "remaining quota."
+            ) from exc
+        raise
     result = TurnResult.model_validate_json(response.text or "")
     for update in result.memory_updates:
         apply_memory_update(update, session_id=session_id)
@@ -511,14 +532,10 @@ class _LiveSession:
                     {"type": "agent.question", "text": result.question}
                 )
 
-            await self._speak(
-                generation,
-                result.speech,
-                _target_language(self.last_language, result.speech),
-            )
-            if generation != self.generation:
-                return
-
+            # Act before speaking, not after. Speech takes seconds; holding the
+            # page until it finishes means hearing "I've filled that in" while
+            # staring at an unchanged form. Filling first also means a barge-in
+            # cannot strand actions the agent already announced.
             if result.actions:
                 await self.send({"type": "state", "state": "acting"})
                 await self.send(
@@ -530,6 +547,14 @@ class _LiveSession:
                         ],
                     }
                 )
+
+            await self._speak(
+                generation,
+                result.speech,
+                _target_language(self.last_language, result.speech),
+            )
+            if generation != self.generation:
+                return
             await self.send(
                 {
                     "type": "state",

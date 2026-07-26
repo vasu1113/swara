@@ -33,15 +33,27 @@ AUDIO_SAMPLE_RATE = 16_000
 
 # Sarvam streaming STT tuning. Deliberately a shade patient: cutting a speaker
 # off mid-thought reads as broken, while a beat of silence reads as listening.
+# Turn-taking. The failure these settings exist to prevent is chopping one
+# sentence into several turns: people pause mid-thought, and every fragment
+# costs a full model call and a spoken reply, so an eager VAD is felt as both
+# "it only heard one word" and "it is slow".
 VAD_SETTINGS = {
     "vad_signals": "true",
-    "high_vad_sensitivity": "true",
-    # Frames of speech before a turn is considered started — filters coughs
-    # and room noise without clipping a real opening word.
-    "min_speech_frames": "6",
+    # Deliberately NOT high sensitivity. High sensitivity ends a turn on the
+    # briefest gap, which is exactly the fragmentation we are avoiding.
+    "high_vad_sensitivity": "false",
+    # Speech must be clearly present before a turn starts, so breaths and room
+    # noise do not open one.
+    "min_speech_frames": "10",
+    # Silence required before a turn is considered finished. This is the single
+    # most important value here: it is the pause you are allowed to take
+    # mid-sentence without being cut off.
+    "negative_frames_count": "28",
+    "negative_frames_window": "36",
     # Audio retained from before the trigger, so the first phoneme survives.
-    "pre_speech_pad_frames": "8",
-    # Speech needed to interrupt the agent mid-sentence (barge-in).
+    "pre_speech_pad_frames": "10",
+    # Barge-in stays responsive: interrupting the agent should feel instant
+    # even though ending a turn is patient.
     "interrupt_min_speech_frames": "4",
 }
 
