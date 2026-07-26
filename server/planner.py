@@ -10,7 +10,9 @@ from prompts import SYSTEM_PROMPT, build_user_prompt
 from schemas import ContextItem, PlanRequest, PlanResponse
 
 
-MODEL = "gemini-2.5-flash"
+# Pinned deliberately rather than using -latest: a model swapping under us
+# mid-demo is not a risk worth taking. 2.5-flash is retired for new API keys.
+MODEL = "gemini-3.6-flash"
 
 
 def _context_for_session(session_id: str) -> list[ContextItem]:
