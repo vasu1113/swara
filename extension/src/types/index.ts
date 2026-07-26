@@ -137,10 +137,30 @@ export type PlanResponse = {
  * Extension-internal messaging
  * ------------------------------------------------------------------ */
 
+export type SwaraPingMessage = { type: 'SWARA_PING' };
+export type SwaraPongMessage = {
+  type: 'SWARA_PONG';
+  url: string;
+  title: string;
+};
+export type SwaraExtractMessage = { type: 'SWARA_EXTRACT' };
+export type SwaraExtractResultMessage = {
+  type: 'SWARA_EXTRACT_RESULT';
+  page: PageContext;
+};
+export type SwaraExecuteMessage = {
+  type: 'SWARA_EXECUTE';
+  actions: Action[];
+};
+export type SwaraExecuteResultMessage = {
+  type: 'SWARA_EXECUTE_RESULT';
+  results: ActionResult[];
+};
+
 export type SwaraMessage =
-  | { type: 'SWARA_PING' }
-  | { type: 'SWARA_PONG'; url: string; title: string }
-  | { type: 'SWARA_EXTRACT' }
-  | { type: 'SWARA_EXTRACT_RESULT'; page: PageContext }
-  | { type: 'SWARA_EXECUTE'; actions: Action[] }
-  | { type: 'SWARA_EXECUTE_RESULT'; results: ActionResult[] };
+  | SwaraPingMessage
+  | SwaraPongMessage
+  | SwaraExtractMessage
+  | SwaraExtractResultMessage
+  | SwaraExecuteMessage
+  | SwaraExecuteResultMessage;
