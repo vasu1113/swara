@@ -57,6 +57,28 @@ What they write into a form is a separate question from what you say aloud. \
 Form answers follow the form's language — an English application gets English \
 answers even when they instructed you in Hindi.
 
+## What to remember, and for how long
+
+Sort anything they tell you by what it actually is. Getting the lifetime wrong \
+is worse than not remembering at all — it means either forgetting something \
+they wanted kept, or permanently learning something they meant for one page.
+
+- **fact** — a durable truth about them ("I worked at HyperVerge"). Persistent. \
+It should still be true next year.
+- **correction** — replaces something you already believed ("it's Jar, not \
+Lar"). Persistent. Set the old value so it can supersede the right thing.
+- **instruction** — a constraint on *this page only* ("don't mention my \
+startup here"). Task-scoped. Almost never persistent: they are telling you how \
+to handle what is in front of them, not issuing a standing order.
+- **preference** — how they want things written ("keep it short"). Task-scoped \
+unless they plainly mean always.
+
+Resist the urge to generalise. "Don't mention my startup" on a job application \
+is not "never mention my startup" — the next form may be exactly where it \
+belongs. When it is genuinely ambiguous, take the narrower scope.
+
+Not every turn contains something to remember. "Fill this in" contains nothing.
+
 ## Being interrupted
 
 If they cut across you, they have heard enough. Stop, and answer what they \
@@ -117,6 +139,24 @@ def _render_fields(page: PageContext) -> str:
     return "\n".join(lines)
 
 
+def _render_controls(page: PageContext) -> str:
+    if not page.controls:
+        return ""
+
+    lines = ["\n### Things you can click"]
+    for control in page.controls:
+        if control.disabled:
+            continue
+        note = "  — you cannot click this one" if control.role == "submit" else ""
+        lines.append(f'- "{control.control_id}" ({control.role}): {control.label}{note}')
+    lines.append(
+        "\nUse a `click` action with the control's id in `fieldId`. Submitting, "
+        "sending, paying and deleting are refused by design; if they want the "
+        "form submitted, tell them to press it themselves."
+    )
+    return "\n".join(lines)
+
+
 def _render_history(history: list[Turn]) -> str:
     if not history:
         return "(this is the start of the conversation)"
@@ -137,7 +177,7 @@ def build_opening_prompt(page: PageContext, context_items: list[ContextItem]) ->
 
 {page.title}{f" — {page.heading}" if page.heading else ""}
 
-{_render_fields(page)}
+{_render_fields(page)}{_render_controls(page)}
 
 ## Now
 
@@ -164,7 +204,7 @@ def build_turn_prompt(
 
 {page.title}{f" — {page.heading}" if page.heading else ""}
 
-{_render_fields(page)}
+{_render_fields(page)}{_render_controls(page)}
 
 ## Conversation so far
 

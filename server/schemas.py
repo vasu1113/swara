@@ -15,7 +15,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 FieldType = Literal["text", "textarea", "select", "checkbox", "radio"]
-ActionType = Literal["fill", "select", "check", "uncheck", "clear"]
+ActionType = Literal[
+    "fill", "select", "check", "uncheck", "clear", "click", "scroll_to"
+]
 MemoryType = Literal["fact", "correction", "preference", "instruction"]
 MemoryScope = Literal["persistent", "session", "task"]
 ContextItemType = Literal[
@@ -54,11 +56,26 @@ class FormField(Base):
     current_value: str | None = None
 
 
+class PageControl(Base):
+    """A clickable control on the page.
+
+    `role="submit"` marks anything whose label reads as irreversible (submit,
+    apply, send, pay, delete). The executor refuses those outright — the agent
+    must never be able to submit someone's job application.
+    """
+
+    control_id: str
+    label: str
+    role: Literal["button", "link", "tab", "submit"] = "button"
+    disabled: bool = False
+
+
 class PageContext(Base):
     url: str
     title: str
     heading: str | None = None
     fields: list[FormField] = Field(default_factory=list)
+    controls: list[PageControl] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------- #

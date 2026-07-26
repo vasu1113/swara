@@ -44,19 +44,36 @@ export type FormField = {
   currentValue?: string;
 };
 
+export type PageControl = {
+  /** Stable identifier the executor uses to find this control again. */
+  controlId: string;
+  /** Cleaned visible text, with accessible fallbacks when it has none. */
+  label: string;
+  role: 'button' | 'link' | 'tab' | 'submit';
+  disabled: boolean;
+};
+
 export type PageContext = {
   url: string;
   title: string;
   /** The page's main heading, e.g. the job title. Useful planner context. */
   heading?: string;
   fields: FormField[];
+  controls: PageControl[];
 };
 
 /* ------------------------------------------------------------------ *
  * Actions (server -> side panel -> content script)
  * ------------------------------------------------------------------ */
 
-export type ActionType = 'fill' | 'select' | 'check' | 'uncheck' | 'clear';
+export type ActionType =
+  | 'fill'
+  | 'select'
+  | 'check'
+  | 'uncheck'
+  | 'clear'
+  | 'click'
+  | 'scroll_to';
 
 export type Action = {
   fieldId: string;

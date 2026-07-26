@@ -2,6 +2,7 @@ import type {
   FieldOption,
   FieldType,
   FormField,
+  PageControl,
   PageContext,
 } from '../types';
 
@@ -16,6 +17,13 @@ export type ExtractableFieldTarget = {
   elements: FormControlElement[];
 };
 
+export type ExtractableControlTarget = {
+  controlId: string;
+  element: HTMLElement;
+  role: PageControl['role'];
+  disabled: boolean;
+};
+
 const TEXT_INPUT_TYPES = new Set([
   'text',
   'email',
@@ -25,6 +33,8 @@ const TEXT_INPUT_TYPES = new Set([
   'number',
   'password',
 ]);
+
+const DESTRUCTIVE_CONTROL_LABEL = /submit|apply|send|pay|delete|remove|confirm/i;
 
 function isRendered(element: HTMLElement): boolean {
   return (
@@ -54,6 +64,19 @@ export function isExtractableControl(
     element.type === 'radio' ||
     element.type === 'checkbox'
   );
+}
+
+function isDisabledControl(element: HTMLElement): boolean {
+  return (
+    element.hasAttribute('disabled') ||
+    element.getAttribute('aria-disabled')?.toLocaleLowerCase() === 'true'
+  );
+}
+
+export function isExtractablePageControl(
+  element: Element,
+): element is HTMLElement {
+  return element instanceof HTMLElement && !isDisabledControl(element) && isRendered(element);
 }
 
 function controlType(element: FormControlElement): FieldType {
@@ -140,6 +163,55 @@ function cleanElementText(element: Element): string {
     }
   });
   return collapseText(clone.textContent ?? '');
+}
+
+function controlLabel(element: HTMLElement): string {
+  const visibleText = cleanElementText(element);
+  if (visibleText) {
+    return visibleText;
+  }
+
+  return collapseText(
+    element.getAttribute('aria-label') ??
+      element.getAttribute('title') ??
+      element.getAttribute('value') ??
+      '',
+  );
+}
+
+function controlRole(
+  element: HTMLElement,
+  label: string,
+): PageControl['role'] {
+  if (DESTRUCTIVE_CONTROL_LABEL.test(label)) {
+    return 'submit';
+  }
+  if (element.getAttribute('role') === 'tab') {
+    return 'tab';
+  }
+  if (element instanceof HTMLAnchorElement) {
+    return 'link';
+  }
+  return 'button';
+}
+
+export function collectExtractableControlTargets(): ExtractableControlTarget[] {
+  const controls = Array.from(
+    document.querySelectorAll(
+      'button, a[href], [role="button"], [role="tab"], input[type="submit"], input[type="button"]',
+    ),
+  ).filter(isExtractablePageControl);
+
+  return controls.map((element, index) => {
+    const label = controlLabel(element);
+    return {
+      controlId:
+        element.id || element.getAttribute('name') || `control:${index}`,
+      element,
+      role: controlRole(element, label),
+      disabled: isDisabledControl(element),
+    };
+  });
 }
 
 function labelForId(id: string): HTMLLabelElement | undefined {
@@ -331,5 +403,29 @@ export function extractPage(): PageContext {
       ? { heading: cleanElementText(headingElement) }
       : {}),
     fields: collectExtractableFieldTargets().map(fieldFromTarget),
+    controls: collectExtractableControlTargets().map(
+      ({ controlId, role, disabled, element }) => ({
+        controlId,
+        label: controlLabel(element),
+        role,
+        disabled,
+      }),
+    ),
   };
+}
+
+export function hasPageChanged(
+  previous: PageContext,
+  current: PageContext,
+): boolean {
+  if (previous.url !== current.url || previous.heading !== current.heading) {
+    return true;
+  }
+
+  const previousFieldIds = new Set(previous.fields.map((field) => field.fieldId));
+  const currentFieldIds = new Set(current.fields.map((field) => field.fieldId));
+  return (
+    previousFieldIds.size !== currentFieldIds.size ||
+    [...previousFieldIds].some((fieldId) => !currentFieldIds.has(fieldId))
+  );
 }

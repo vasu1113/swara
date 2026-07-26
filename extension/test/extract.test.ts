@@ -41,6 +41,7 @@ async function loadFixture(name: string) {
     'HTMLInputElement',
     'HTMLTextAreaElement',
     'HTMLSelectElement',
+    'HTMLAnchorElement',
     'HTMLLabelElement',
     'HTMLLegendElement',
     'HTMLElement',
@@ -124,6 +125,18 @@ check('captures the page heading', () => {
   assert.match(job.heading ?? '', /Senior AI Product Manager/i);
 });
 
+check('extracts labelled job controls and flags submission', () => {
+  assert.deepEqual(
+    job.controls.map((control: any) => [control.label, control.role]),
+    [
+      ['Careers', 'link'],
+      ['About', 'link'],
+      ['Save as draft', 'button'],
+      ['Submit Application →', 'submit'],
+    ],
+  );
+});
+
 console.log('\nevent-registration.html');
 const evt = await loadFixture('event-registration.html');
 const evtById = new Map(evt.fields.map((f: any) => [f.fieldId, f]));
@@ -141,6 +154,26 @@ check('treats the lone speaker checkbox as a checkbox field', () => {
 check('every field has a non-empty question', () => {
   const blank = [...job.fields, ...evt.fields].filter((f: any) => !f.question.trim());
   assert.equal(blank.length, 0, `blank questions: ${blank.map((f: any) => f.fieldId).join(', ')}`);
+});
+
+check('extracts and flags the event registration control', () => {
+  assert.deepEqual(
+    evt.controls.map((control: any) => [control.label, control.role]),
+    [['Confirm Registration →', 'submit']],
+  );
+});
+
+const { hasPageChanged } = await import('../src/content/extract.ts?page-change');
+
+check('detects changed field ids but not an identical page', () => {
+  assert.equal(hasPageChanged(job, { ...job, fields: [...job.fields] }), false);
+  assert.equal(
+    hasPageChanged(job, {
+      ...job,
+      fields: [{ ...job.fields[0], fieldId: 'different_field' }],
+    }),
+    true,
+  );
 });
 
 console.log(

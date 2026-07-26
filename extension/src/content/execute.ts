@@ -1,7 +1,9 @@
 import type { Action, ActionResult } from '../types';
 import {
+  collectExtractableControlTargets,
   collectExtractableFieldTargets,
   isExtractableControl,
+  type ExtractableControlTarget,
   type FormControlElement,
 } from './extract';
 
@@ -38,6 +40,30 @@ function resolveControls(fieldId: string): FormControlElement[] {
     (target) => target.fieldId === fieldId,
   );
   return positional?.elements ?? [];
+}
+
+function resolvePageControl(controlId: string): ExtractableControlTarget | undefined {
+  const controls = collectExtractableControlTargets();
+  const byId = document.getElementById(controlId);
+  if (byId) {
+    const target = controls.find(({ element }) => element === byId);
+    if (target) {
+      return target;
+    }
+  }
+
+  const byName = controls.find(
+    ({ element }) => element.getAttribute('name') === controlId,
+  );
+  if (byName) {
+    return byName;
+  }
+
+  return controls.find((target) => target.controlId === controlId);
+}
+
+function scrollIntoView(element: HTMLElement): void {
+  element.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 function focusAndBlur(
@@ -215,12 +241,44 @@ function executeAction(
       setChecked(checkbox, action.action === 'check');
       return checkbox;
     }
+
+    case 'click':
+    case 'scroll_to':
+      throw new Error(`${action.action} is not a field action`);
   }
 }
 
 export function executeActions(actions: Action[]): ActionResult[] {
   return actions.map((action) => {
     try {
+      if (action.action === 'click') {
+        const control = resolvePageControl(action.fieldId);
+        if (!control) {
+          throw new Error(`Control "${action.fieldId}" was not found`);
+        }
+        if (control.role === 'submit') {
+          return {
+            fieldId: action.fieldId,
+            ok: false,
+            error: 'Refused: submitting is left to you.',
+          };
+        }
+        scrollIntoView(control.element);
+        control.element.click();
+        highlight(control.element);
+        return { fieldId: action.fieldId, ok: true };
+      }
+
+      if (action.action === 'scroll_to') {
+        const target = resolvePageControl(action.fieldId)?.element ?? resolveControls(action.fieldId)[0];
+        if (!target) {
+          throw new Error(`Target "${action.fieldId}" was not found`);
+        }
+        scrollIntoView(target);
+        highlight(target);
+        return { fieldId: action.fieldId, ok: true };
+      }
+
       const controls = resolveControls(action.fieldId);
       if (controls.length === 0) {
         throw new Error(`Field "${action.fieldId}" was not found`);

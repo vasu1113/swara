@@ -25,6 +25,14 @@ Object.defineProperty(dom.window.HTMLElement.prototype, 'offsetParent', {
   },
 });
 
+const scrolledElements: HTMLElement[] = [];
+Object.defineProperty(dom.window.HTMLElement.prototype, 'scrollIntoView', {
+  configurable: true,
+  value(this: HTMLElement) {
+    scrolledElements.push(this);
+  },
+});
+
 const g = globalThis as Record<string, unknown>;
 g.window = dom.window;
 g.document = dom.window.document;
@@ -32,6 +40,7 @@ g.location = dom.window.location;
 g.Event = dom.window.Event;
 for (const ctor of [
   'HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement',
+  'HTMLAnchorElement',
   'HTMLLabelElement', 'HTMLLegendElement', 'HTMLElement', 'Element',
 ]) {
   g[ctor] = (dom.window as unknown as Record<string, unknown>)[ctor];
@@ -66,6 +75,15 @@ const results = executeActions([
   { fieldId: 'work_authorization', action: 'select', value: 'yes' },
   { fieldId: 'areas_of_interest', action: 'check', value: 'ml' },
   { fieldId: 'no_such_field', action: 'fill', value: 'x' },
+]);
+
+let saveDraftClicks = 0;
+doc.querySelector<HTMLButtonElement>('.save-draft')!.addEventListener('click', () => {
+  saveDraftClicks += 1;
+});
+const controlResults = executeActions([
+  { fieldId: 'control:2', action: 'click', value: '' },
+  { fieldId: 'control:3', action: 'click', value: '' },
 ]);
 
 console.log('\nexecutor');
@@ -105,6 +123,20 @@ check('reports a per-action failure without aborting the batch', () => {
   const bad = results.find((r) => r.fieldId === 'no_such_field')!;
   assert.equal(bad.ok, false);
   assert.match(bad.error ?? '', /not found/i);
+});
+
+check('clicks a non-submit control', () => {
+  assert.equal(controlResults[0].ok, true);
+  assert.equal(saveDraftClicks, 1);
+  assert.equal(scrolledElements.includes(doc.querySelector('.save-draft')!), true);
+});
+
+check('refuses a submit-role control', () => {
+  assert.deepEqual(controlResults[1], {
+    fieldId: 'control:3',
+    ok: false,
+    error: 'Refused: submitting is left to you.',
+  });
 });
 
 console.log(
