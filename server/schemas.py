@@ -104,6 +104,18 @@ class PlanRequest(Base):
     instruction: str
 
 
+class MemoryApplyRequest(Base):
+    """Commit the memory the planner proposed, once the user accepts the plan.
+
+    Applied on confirmation rather than at plan time: the preview promises
+    "here is what I will remember", so nothing is remembered until the user
+    agrees to it, and re-planning cannot accumulate duplicates.
+    """
+
+    session_id: str
+    memory_updates: list[MemoryUpdate] = Field(default_factory=list)
+
+
 class PlanResponse(Base):
     status: Literal["ready", "needs_clarification"] = "ready"
     actions: list[Action] = Field(default_factory=list)

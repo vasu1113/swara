@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getHealth, postPlan, postSpeechToText, postTextToSpeech } from './api';
+import { getHealth, postMemoryApply, postPlan, postSpeechToText, postTextToSpeech } from './api';
 import type {
   Action,
   ActionResult,
@@ -72,6 +72,7 @@ function App() {
   const [instruction, setInstruction] = useState('');
   const [plan, setPlan] = useState<PlanResponse | null>(null);
   const [results, setResults] = useState<ActionResult[] | null>(null);
+  const [memorySaved, setMemorySaved] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [planning, setPlanning] = useState(false);
@@ -291,6 +292,18 @@ function App() {
       const actionResults = extractResults(response);
       if (!actionResults) throw new Error('The page returned an invalid fill result. Try reloading the tab.');
       setResults(actionResults);
+
+      // Memory is committed only now, on acceptance — the preview promised
+      // what would be remembered. A failure here must not look like a failed
+      // fill, since the form was already filled successfully.
+      if (plan.memoryUpdates.length > 0) {
+        try {
+          await postMemoryApply({ sessionId, memoryUpdates: plan.memoryUpdates });
+          setMemorySaved(plan.memoryUpdates.length);
+        } catch {
+          setMemorySaved(null);
+        }
+      }
     } catch (fillError) {
       setError(fillError instanceof Error ? fillError.message : 'Unable to fill this form.');
     } finally {
@@ -446,7 +459,10 @@ function App() {
 
       {results && (
         <section className="results" aria-live="polite">
-          <p className="results-summary">{filledCount} of {results.length} filled</p>
+          <p className="results-summary">
+            {filledCount} of {results.length} filled
+            {memorySaved !== null && ` · ${memorySaved} remembered`}
+          </p>
           <ul>{results.map((result, index) => <li className={result.ok ? 'result-ok' : 'result-error'} key={`${result.fieldId}-${index}`}><span>{result.ok ? 'OK' : 'Error'}</span><p><strong>{fieldQuestion(result.fieldId)}</strong>{result.error && <small>{result.error}</small>}</p></li>)}</ul>
         </section>
       )}

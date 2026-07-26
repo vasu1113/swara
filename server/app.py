@@ -7,10 +7,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from config import settings
-from context_store import list_context, seed_profile
+from context_store import apply_memory_update, list_context, seed_profile
 from documents import router as documents_router
 from planner import plan
-from schemas import ContextItem, PlanRequest, PlanResponse
+from schemas import ContextItem, MemoryApplyRequest, PlanRequest, PlanResponse
 from voice import router as voice_router
 
 
@@ -56,6 +56,20 @@ def seed_context() -> list[ContextItem]:
 @app.post("/plan", response_model=PlanResponse)
 def make_plan(request: PlanRequest) -> PlanResponse:
     return plan(request)
+
+
+@app.post("/memory/apply", response_model=list[ContextItem])
+def apply_memory(request: MemoryApplyRequest) -> list[ContextItem]:
+    """Persist the plan's classified memory once the user has accepted it.
+
+    Each update is routed by its own type: corrections supersede the fact they
+    replace, instructions stay bound to this session, facts and preferences
+    become persistent.
+    """
+    return [
+        apply_memory_update(update, session_id=request.session_id)
+        for update in request.memory_updates
+    ]
 
 
 app.include_router(documents_router)

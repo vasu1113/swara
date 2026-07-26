@@ -1,4 +1,4 @@
-import type { PlanRequest, PlanResponse, SpeechRequest, SpeechResponse, TranscriptResponse } from '../types';
+import type { MemoryApplyRequest, PlanRequest, PlanResponse, SpeechRequest, SpeechResponse, TranscriptResponse } from '../types';
 
 // 8000 is a common default and was already taken on the dev machine; 8787 keeps
 // Swara out of the way of whatever else is running locally.
@@ -62,4 +62,15 @@ export async function postTextToSpeech(request: SpeechRequest): Promise<SpeechRe
 
   if (!response.ok) throw await serverError(response);
   return (await response.json()) as SpeechResponse;
+}
+
+export async function postMemoryApply(request: MemoryApplyRequest): Promise<unknown> {
+  const response = await fetch(`${API_BASE_URL}/memory/apply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) throw await serverError(response);
+  return response.json();
 }

@@ -120,6 +120,16 @@ export type PlanRequest = {
   instruction: string;
 };
 
+/**
+ * Sent once the user accepts a plan. Memory is committed on confirmation, not
+ * at plan time — the preview promises what will be remembered, so nothing is
+ * written until the user agrees.
+ */
+export type MemoryApplyRequest = {
+  sessionId: string;
+  memoryUpdates: MemoryUpdate[];
+};
+
 export type PlanResponse = {
   status: 'ready' | 'needs_clarification';
   actions: Action[];
