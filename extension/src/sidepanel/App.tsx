@@ -27,6 +27,52 @@ type ContextPanel = { relevant: ContextUsage[]; excluded: ContextUsage[] };
 type PlaybackChunk = { data: string; mimeType: string };
 
 const MP3_MIME = 'audio/mpeg';
+const PCM_MIME = 'audio/pcm';
+
+/**
+ * Plays raw 16 kHz PCM chunks gaplessly through Web Audio.
+ *
+ * Pipecat emits raw PCM rather than MP3, which MediaSource cannot accept. Each
+ * chunk is scheduled against a running cursor rather than played on arrival,
+ * so consecutive chunks butt up against each other instead of leaving audible
+ * seams between them.
+ */
+class PcmPlayer {
+  private ctx: AudioContext | null = null;
+  private cursor = 0;
+  private sources = new Set<AudioBufferSourceNode>();
+
+  push(bytes: Uint8Array) {
+    if (!this.ctx) this.ctx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+    const ctx = this.ctx;
+    const samples = new Int16Array(
+      bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+    );
+    if (!samples.length) return;
+
+    const buffer = ctx.createBuffer(1, samples.length, AUDIO_SAMPLE_RATE);
+    const channel = buffer.getChannelData(0);
+    for (let i = 0; i < samples.length; i += 1) channel[i] = samples[i] / 0x8000;
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    // A small lead keeps scheduling ahead of playback when chunks arrive late.
+    const startAt = Math.max(ctx.currentTime + 0.02, this.cursor);
+    source.start(startAt);
+    this.cursor = startAt + buffer.duration;
+    this.sources.add(source);
+    source.onended = () => this.sources.delete(source);
+  }
+
+  stop() {
+    for (const source of this.sources) {
+      try { source.stop(); } catch { /* already ended */ }
+    }
+    this.sources.clear();
+    this.cursor = 0;
+  }
+}
 
 /** Swallow the DOM exceptions MediaSource throws on races we can't prevent. */
 function with_suppress(fn: () => void) {
@@ -149,6 +195,7 @@ function App() {
   const mediaSourceRef = useRef<MediaSource | null>(null);
   const sourceBufferRef = useRef<SourceBuffer | null>(null);
   const audioCompleteRef = useRef(false);
+  const pcmPlayerRef = useRef<PcmPlayer>(new PcmPlayer());
   const activeActionRef = useRef<string | null>(null);
   const startingRef = useRef(false);
   const agentStateRef = useRef<AgentState>('idle');
@@ -161,6 +208,7 @@ function App() {
   };
 
   const stopPlayback = () => {
+    pcmPlayerRef.current.stop();
     playbackQueueRef.current = [];
     sourceBufferRef.current = null;
     mediaSourceRef.current = null;
@@ -360,6 +408,10 @@ function App() {
         // showed every question twice.
         return;
       case 'agent.audio':
+        if (message.mimeType.startsWith(PCM_MIME)) {
+          pcmPlayerRef.current.push(fromBase64(message.data));
+          return;
+        }
         playbackQueueRef.current.push({ data: message.data, mimeType: message.mimeType });
         ensurePlaybackStream();
         drainPlaybackQueue();
