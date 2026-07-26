@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/extract.test.ts && tsx test/execute.test.ts"
+    "test": "node --import tsx test/extract.test.ts && node --import tsx test/execute.test.ts"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -32,6 +32,13 @@ export type AgentState =
 
 export const AUDIO_SAMPLE_RATE = 16_000;
 
+/**
+ * The session endpoint, kept here rather than in either half's code — stating
+ * it separately in two places is how the client ends up dialling a path the
+ * server never mounted.
+ */
+export const SESSION_PATH = '/session/live';
+
 /* ---------------------------- client -> server ---------------------------- */
 
 export type ClientMessage =

@@ -11,6 +11,7 @@ from context_store import apply_memory_update, list_context, seed_profile
 from documents import router as documents_router
 from planner import plan
 from schemas import ContextItem, MemoryApplyRequest, PlanRequest, PlanResponse
+from session import live_session
 from voice import router as voice_router
 
 
@@ -73,4 +74,5 @@ def apply_memory(request: MemoryApplyRequest) -> list[ContextItem]:
 
 
 app.include_router(documents_router)
+app.add_api_websocket_route("/session/live", live_session)
 app.include_router(voice_router)

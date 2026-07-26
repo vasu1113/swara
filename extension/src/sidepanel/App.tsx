@@ -1,21 +1,37 @@
-import { useEffect, useRef, useState } from 'react';
-import { getHealth, postMemoryApply, postPlan, postSpeechToText, postTextToSpeech } from './api';
+import { FormEvent, useEffect, useRef, useState } from 'react';
+import { API_BASE_URL } from './api';
+import {
+  AUDIO_SAMPLE_RATE,
+  SESSION_PATH,
+  type AgentState,
+  type ClientMessage,
+  type ServerMessage,
+} from '../types/session';
 import type {
   Action,
   ActionResult,
+  ContextUsage,
+  MemoryUpdate,
   PageContext,
-  PlanResponse,
   SwaraExecuteResultMessage,
   SwaraExtractResultMessage,
   SwaraMessage,
 } from '../types';
 
-type HealthStatus = 'checking' | 'connected' | 'offline';
+type ConversationItem =
+  | { id: string; kind: 'user' | 'agent'; text: string }
+  | { id: string; kind: 'actions'; actions: Action[]; results?: ActionResult[] }
+  | { id: string; kind: 'memory'; updates: MemoryUpdate[] };
+
+type ContextPanel = { relevant: ContextUsage[]; excluded: ContextUsage[] };
+type PlaybackChunk = { data: string; mimeType: string };
 
 const makeSessionId = () =>
   typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : `swara-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+const sessionUrl = () => `${API_BASE_URL.replace(/^http/, 'ws')}${SESSION_PATH}`;
 
 function isPageContext(value: unknown): value is PageContext {
   return (
@@ -29,24 +45,20 @@ function isPageContext(value: unknown): value is PageContext {
 function extractPage(value: unknown): PageContext | null {
   if (isPageContext(value)) return value;
   const result = value as Partial<SwaraExtractResultMessage> | null;
-  return result && result.type === 'SWARA_EXTRACT_RESULT' && isPageContext(result.page)
-    ? result.page
-    : null;
+  return result?.type === 'SWARA_EXTRACT_RESULT' && isPageContext(result.page) ? result.page : null;
 }
 
 function extractResults(value: unknown): ActionResult[] | null {
   if (Array.isArray(value)) return value as ActionResult[];
   const result = value as Partial<SwaraExecuteResultMessage> | null;
-  return result && result.type === 'SWARA_EXECUTE_RESULT' && Array.isArray(result.results)
-    ? result.results
-    : null;
+  return result?.type === 'SWARA_EXECUTE_RESULT' && Array.isArray(result.results) ? result.results : null;
 }
 
 function contentScriptError(message?: string): string {
   if (message?.toLowerCase().includes('receiving end')) {
-    return 'Could not reach this page. Reload the tab, then try scanning again.';
+    return 'Could not reach this page. Reload the tab, then try Swara again.';
   }
-  return message ?? 'Could not reach this page. Reload the tab, then try scanning again.';
+  return message ?? 'Could not reach this page. Reload the tab, then try Swara again.';
 }
 
 async function sendToActiveTab(message: SwaraMessage): Promise<unknown> {
@@ -65,453 +77,486 @@ async function sendToActiveTab(message: SwaraMessage): Promise<unknown> {
   });
 }
 
-/**
- * Opens the permission page in a tab.
- *
- * `chrome.runtime.openOptionsPage()` is the idiomatic call but fails silently
- * from a side panel, so open the URL directly and surface anything that goes
- * wrong rather than leaving a dead button.
- */
 async function openPermissionPage(): Promise<string | null> {
   const url = chrome.runtime.getURL('src/permission/index.html');
   try {
     await chrome.tabs.create({ url });
     return null;
   } catch (error) {
-    return error instanceof Error
-      ? error.message
-      : `Could not open ${url}. Paste it into a new tab to grant access.`;
+    return error instanceof Error ? error.message : `Could not open ${url}.`;
   }
+}
+
+function toBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const parts: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    parts.push(String.fromCharCode(...bytes.subarray(offset, offset + 0x8000)));
+  }
+  return btoa(parts.join(''));
+}
+
+function fromBase64(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function actionSummary(actions: Action[], results?: ActionResult[]): string {
+  if (!results) return `Working on ${actions.length} ${actions.length === 1 ? 'field' : 'fields'}…`;
+  const completed = results.filter((result) => result.ok).length;
+  return `Filled ${completed} of ${results.length} ${results.length === 1 ? 'field' : 'fields'}`;
 }
 
 function App() {
   const [sessionId] = useState(makeSessionId);
-  const [health, setHealth] = useState<HealthStatus>('checking');
-  const [page, setPage] = useState<PageContext | null>(null);
-  const [instruction, setInstruction] = useState('');
-  const [plan, setPlan] = useState<PlanResponse | null>(null);
-  const [results, setResults] = useState<ActionResult[] | null>(null);
-  const [memorySaved, setMemorySaved] = useState<number | null>(null);
-  const [needsMicPermission, setNeedsMicPermission] = useState(false);
+  const [agentState, setAgentState] = useState<AgentState>('idle');
+  const [conversation, setConversation] = useState<ConversationItem[]>([]);
+  const [partialTranscript, setPartialTranscript] = useState('');
+  const [typedText, setTypedText] = useState('');
+  const [context, setContext] = useState<ContextPanel>({ relevant: [], excluded: [] });
+  const [audioLevel, setAudioLevel] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [scanning, setScanning] = useState(false);
-  const [planning, setPlanning] = useState(false);
-  const [filling, setFilling] = useState(false);
-  const [expandedActions, setExpandedActions] = useState<Set<number>>(new Set());
-  const [recording, setRecording] = useState(false);
-  const [transcribing, setTranscribing] = useState(false);
-  const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const [voiceError, setVoiceError] = useState<string | null>(null);
-  const [speaking, setSpeaking] = useState(false);
-  const [speechError, setSpeechError] = useState<string | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const recordingChunksRef = useRef<Blob[]>([]);
-  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const shouldTranscribeRef = useRef(false);
-  const isMountedRef = useRef(true);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [needsMicPermission, setNeedsMicPermission] = useState(false);
+  const [sessionOpen, setSessionOpen] = useState(false);
 
-  const stopStream = () => {
+  const socketRef = useRef<WebSocket | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const workletRef = useRef<AudioWorkletNode | null>(null);
+  const silentGainRef = useRef<GainNode | null>(null);
+  const playbackRef = useRef<HTMLAudioElement | null>(null);
+  const playbackUrlRef = useRef<string | null>(null);
+  const playbackQueueRef = useRef<PlaybackChunk[]>([]);
+  const activeActionRef = useRef<string | null>(null);
+  const startingRef = useRef(false);
+  const agentStateRef = useRef<AgentState>('idle');
+  const mountedRef = useRef(true);
+  const transcriptEndRef = useRef<HTMLDivElement | null>(null);
+
+  const send = (message: ClientMessage) => {
+    const socket = socketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+  };
+
+  const stopPlayback = () => {
+    playbackQueueRef.current = [];
+    const audio = playbackRef.current;
+    if (audio) {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      playbackRef.current = null;
+    }
+    if (playbackUrlRef.current) {
+      URL.revokeObjectURL(playbackUrlRef.current);
+      playbackUrlRef.current = null;
+    }
+  };
+
+  /**
+   * Plays the turn's speech as one stream.
+   *
+   * Sarvam streams MP3 frames, not standalone files, so playing each chunk in
+   * its own Audio element stutters: every element pays play() startup latency
+   * and a partial chunk may not decode alone. MP3 frames concatenate into a
+   * valid stream, so we join them and play once. Costs a beat before the agent
+   * starts speaking; buys speech that doesn't sound broken.
+   */
+  const playBufferedTurn = () => {
+    const chunks = playbackQueueRef.current;
+    if (playbackRef.current || chunks.length === 0) return;
+    playbackQueueRef.current = [];
+
+    const parts = chunks.map((chunk) => fromBase64(chunk.data));
+    const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    const joined = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      joined.set(part, offset);
+      offset += part.byteLength;
+    }
+
+    const url = URL.createObjectURL(
+      new Blob([joined.buffer as ArrayBuffer], { type: chunks[0].mimeType }),
+    );
+    const audio = new Audio(url);
+    playbackRef.current = audio;
+    playbackUrlRef.current = url;
+    const finish = () => {
+      if (playbackRef.current !== audio) return;
+      playbackRef.current = null;
+      if (playbackUrlRef.current === url) {
+        URL.revokeObjectURL(url);
+        playbackUrlRef.current = null;
+      }
+    };
+    audio.onended = finish;
+    audio.onerror = finish;
+    void audio.play().catch(finish);
+  };
+
+  const stopCapture = () => {
+    workletRef.current?.disconnect();
+    workletRef.current = null;
+    silentGainRef.current?.disconnect();
+    silentGainRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    const audioContext = audioContextRef.current;
+    audioContextRef.current = null;
+    if (audioContext && audioContext.state !== 'closed') void audioContext.close();
+    if (mountedRef.current) setAudioLevel(0);
   };
 
-  const clearRecordingTimer = () => {
-    if (recordingTimerRef.current !== null) {
-      clearInterval(recordingTimerRef.current);
-      recordingTimerRef.current = null;
+  const closeSession = (tellServer: boolean) => {
+    startingRef.current = false;
+    if (tellServer) send({ type: 'session.stop' });
+    socketRef.current?.close();
+    socketRef.current = null;
+    stopCapture();
+    stopPlayback();
+    activeActionRef.current = null;
+    if (mountedRef.current) {
+      setSessionOpen(false);
+      setAgentState('idle');
+      setPartialTranscript('');
     }
   };
 
   useEffect(() => {
-    const checkHealth = async () => {
-      try {
-        await getHealth();
-        setHealth('connected');
-      } catch {
-        setHealth('offline');
-      }
-    };
-    void checkHealth();
-  }, []);
-
-  useEffect(() => {
-    isMountedRef.current = true;
+    mountedRef.current = true;
     return () => {
-      isMountedRef.current = false;
-      shouldTranscribeRef.current = false;
-      clearRecordingTimer();
-      const recorder = recorderRef.current;
-      if (recorder && recorder.state !== 'inactive') recorder.stop();
-      stopStream();
+      mountedRef.current = false;
+      closeSession(true);
     };
   }, []);
 
-  const scanPage = async () => {
-    setScanning(true);
-    setError(null);
-    setPlan(null);
-    setResults(null);
+  useEffect(() => {
+    agentStateRef.current = agentState;
+  }, [agentState]);
+
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+  }, [conversation, partialTranscript]);
+
+  const updateActionResults = (id: string, results: ActionResult[]) => {
+    setConversation((items) =>
+      items.map((item) => (item.kind === 'actions' && item.id === id ? { ...item, results } : item)),
+    );
+  };
+
+  const executeActions = async (actions: Action[]) => {
+    const id = `actions-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    activeActionRef.current = id;
+    setConversation((items) => [...items, { id, kind: 'actions', actions }]);
+    setAgentState('acting');
     try {
-      const response = await sendToActiveTab({ type: 'SWARA_EXTRACT' });
-      const extractedPage = extractPage(response);
-      if (!extractedPage) throw new Error('The page returned an invalid scan result. Try reloading the tab.');
-      setPage(extractedPage);
-    } catch (scanError) {
-      setError(scanError instanceof Error ? scanError.message : 'Unable to scan this page.');
+      const response = await sendToActiveTab({ type: 'SWARA_EXECUTE', actions });
+      const results = extractResults(response);
+      if (!results) throw new Error('The page returned an invalid action result. Try reloading the tab.');
+      updateActionResults(id, results);
+      send({ type: 'action.result', results });
+    } catch (actionError) {
+      const failed = actions.map((action) => ({
+        fieldId: action.fieldId,
+        ok: false,
+        error: actionError instanceof Error ? actionError.message : 'Could not complete this action.',
+      }));
+      updateActionResults(id, failed);
+      send({ type: 'action.result', results: failed });
+      setError(actionError instanceof Error ? actionError.message : 'Unable to act on this page.');
     } finally {
-      setScanning(false);
+      activeActionRef.current = null;
     }
   };
 
-  const createPlan = async () => {
-    if (!page || !instruction.trim()) return;
-    setPlanning(true);
-    setError(null);
-    setResults(null);
-    try {
-      const response = await postPlan({ sessionId, page, instruction: instruction.trim() });
-      setPlan(response);
-      setHealth('connected');
-    } catch (planError) {
-      setHealth('offline');
-      setError(planError instanceof Error ? planError.message : 'Unable to create a plan.');
-    } finally {
-      setPlanning(false);
-    }
-  };
-
-  const startRecording = async () => {
-    setVoiceError(null);
-    setRecordingSeconds(0);
-    let stream: MediaStream | null = null;
-
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (!isMountedRef.current) {
-        stream.getTracks().forEach((track) => track.stop());
+  const handleServerMessage = (message: ServerMessage) => {
+    switch (message.type) {
+      case 'state':
+        setAgentState(message.state);
         return;
-      }
+      case 'speech.start':
+        stopPlayback();
+        send({ type: 'agent.interrupt' });
+        return;
+      case 'agent.audio.end':
+        playBufferedTurn();
+        return;
+      case 'speech.end':
+        return;
+      case 'transcript.partial':
+        setPartialTranscript(message.text);
+        return;
+      case 'transcript.final':
+        setPartialTranscript('');
+        if (message.text.trim()) {
+          setConversation((items) => [...items, { id: `user-${Date.now()}`, kind: 'user', text: message.text }]);
+        }
+        return;
+      case 'agent.text':
+      case 'agent.question':
+        if (message.text.trim()) {
+          setConversation((items) => [...items, { id: `agent-${Date.now()}`, kind: 'agent', text: message.text }]);
+        }
+        return;
+      case 'agent.audio':
+        playbackQueueRef.current.push({ data: message.data, mimeType: message.mimeType });
+        return;
+      case 'agent.actions':
+        void executeActions(message.actions);
+        return;
+      case 'memory.learned':
+        if (message.updates.length) {
+          setConversation((items) => [
+            ...items,
+            { id: `memory-${Date.now()}`, kind: 'memory', updates: message.updates },
+          ]);
+        }
+        return;
+      case 'context.used':
+        setContext({ relevant: message.relevant, excluded: message.excluded });
+        return;
+      case 'error':
+        setError(message.message);
+        setAgentState('error');
+        if (message.fatal) closeSession(false);
+        return;
+    }
+  };
 
-      const supportedMimeType = ['audio/webm;codecs=opus', 'audio/webm'].find((mimeType) =>
-        MediaRecorder.isTypeSupported(mimeType),
-      );
-      const recorder = supportedMimeType
-        ? new MediaRecorder(stream, { mimeType: supportedMimeType })
-        : new MediaRecorder(stream);
+  const startCapture = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!mountedRef.current) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
 
-      streamRef.current = stream;
-      recorderRef.current = recorder;
-      recordingChunksRef.current = [];
-      shouldTranscribeRef.current = true;
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) recordingChunksRef.current.push(event.data);
+    const audioContext = new AudioContext();
+    try {
+      await audioContext.audioWorklet.addModule(new URL('./worklet.ts', import.meta.url));
+      const source = audioContext.createMediaStreamSource(stream);
+      const worklet = new AudioWorkletNode(audioContext, 'swara-pcm-capture', {
+        processorOptions: { targetSampleRate: AUDIO_SAMPLE_RATE },
+      });
+      const silentGain = audioContext.createGain();
+      silentGain.gain.value = 0;
+      source.connect(worklet);
+      worklet.connect(silentGain);
+      silentGain.connect(audioContext.destination);
+      worklet.port.onmessage = (event: MessageEvent<{ type: 'chunk' | 'level'; data: ArrayBuffer | number }>) => {
+        if (event.data.type === 'chunk' && event.data.data instanceof ArrayBuffer) {
+          send({ type: 'audio.chunk', data: toBase64(event.data.data) });
+        }
+        if (event.data.type === 'level' && typeof event.data.data === 'number') setAudioLevel(event.data.data);
       };
-      recorder.onerror = () => {
-        shouldTranscribeRef.current = false;
-        clearRecordingTimer();
-        stopStream();
-        if (isMountedRef.current) {
-          setRecording(false);
-          setVoiceError('Recording stopped because the microphone encountered an error. Please try again.');
+      streamRef.current = stream;
+      audioContextRef.current = audioContext;
+      workletRef.current = worklet;
+      silentGainRef.current = silentGain;
+      await audioContext.resume();
+    } catch (captureError) {
+      stream.getTracks().forEach((track) => track.stop());
+      await audioContext.close();
+      throw new Error(
+        `Microphone capture could not start because the AudioWorklet failed to load. ${
+          captureError instanceof Error ? captureError.message : ''
+        }`.trim(),
+      );
+    }
+  };
+
+  const startSession = async () => {
+    if (sessionOpen || startingRef.current) {
+      startingRef.current = false;
+      closeSession(true);
+      return;
+    }
+    startingRef.current = true;
+    setError(null);
+    setNeedsMicPermission(false);
+    setAgentState('connecting');
+    try {
+      await startCapture();
+      if (!startingRef.current) return;
+      const response = await sendToActiveTab({ type: 'SWARA_EXTRACT' });
+      if (!startingRef.current) return;
+      const page = extractPage(response);
+      if (!page) throw new Error('The page returned an invalid scan result. Reload the tab, then try again.');
+
+      const socket = new WebSocket(sessionUrl());
+      socketRef.current = socket;
+      socket.onopen = () => {
+        startingRef.current = false;
+        socket.send(JSON.stringify({ type: 'session.start', sessionId, page } satisfies ClientMessage));
+        if (mountedRef.current) setSessionOpen(true);
+      };
+      socket.onmessage = (event: MessageEvent<string>) => {
+        try {
+          handleServerMessage(JSON.parse(event.data) as ServerMessage);
+        } catch {
+          setError('The session sent an unreadable response. Please start a new session.');
+          setAgentState('error');
         }
       };
-      recorder.onstop = () => {
-        clearRecordingTimer();
-        stopStream();
-        recorderRef.current = null;
-        if (isMountedRef.current) setRecording(false);
-
-        const blob = new Blob(recordingChunksRef.current, {
-          type: recorder.mimeType || supportedMimeType || 'audio/webm',
-        });
-        if (!shouldTranscribeRef.current || !blob.size || !isMountedRef.current) return;
-
-        void (async () => {
-          setTranscribing(true);
-          try {
-            const response = await postSpeechToText(blob);
-            if (!isMountedRef.current) return;
-            const transcript = response.transcript.trim();
-            if (!transcript) {
-              setVoiceError('No speech was detected. Please try again.');
-              return;
-            }
-            setInstruction((current) => (current.trim() ? `${current.trimEnd()}\n\n${transcript}` : transcript));
-            setHealth('connected');
-          } catch (transcriptionError) {
-            if (!isMountedRef.current) return;
-            setHealth('offline');
-            setVoiceError(transcriptionError instanceof Error ? transcriptionError.message : 'Unable to transcribe the recording.');
-          } finally {
-            if (isMountedRef.current) setTranscribing(false);
-          }
-        })();
+      socket.onerror = () => {
+        startingRef.current = false;
+        setError('Could not connect to the Swara session server.');
+        setAgentState('error');
       };
-
-      recorder.start();
-      setRecording(true);
-      recordingTimerRef.current = setInterval(() => {
-        if (isMountedRef.current) setRecordingSeconds((seconds) => seconds + 1);
-      }, 1000);
-    } catch (recordingError) {
-      stream?.getTracks().forEach((track) => track.stop());
-      clearRecordingTimer();
-      stopStream();
-      const name = recordingError instanceof Error ? recordingError.name : '';
+      socket.onclose = () => {
+        startingRef.current = false;
+        if (!mountedRef.current) return;
+        setSessionOpen(false);
+        if (agentStateRef.current !== 'error') setAgentState('idle');
+      };
+    } catch (startError) {
+      startingRef.current = false;
+      stopCapture();
+      const name = startError instanceof DOMException ? startError.name : '';
       const blocked = name === 'NotAllowedError' || name === 'SecurityError';
       setNeedsMicPermission(blocked);
-      setVoiceError(
+      setError(
         blocked
           ? 'Chrome will not ask for microphone access from inside a side panel.'
-          : recordingError instanceof Error
-            ? recordingError.message
-            : 'Unable to start recording. Please try again.',
+          : startError instanceof Error
+            ? startError.message
+            : 'Unable to start Swara.',
       );
+      setAgentState('error');
     }
   };
 
-  const stopRecording = () => {
-    const recorder = recorderRef.current;
-    if (!recorder || recorder.state === 'inactive') return;
-    shouldTranscribeRef.current = true;
-    recorder.stop();
-    clearRecordingTimer();
-    stopStream();
+  const submitTypedTurn = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const text = typedText.trim();
+    if (!text || !sessionOpen) return;
+    setConversation((items) => [...items, { id: `user-${Date.now()}`, kind: 'user', text }]);
+    send({ type: 'text.turn', text });
+    setTypedText('');
   };
-
-  const toggleRecording = () => {
-    if (recording) stopRecording();
-    else void startRecording();
-  };
-
-  const speakSummary = async () => {
-    if (!plan?.spokenSummary) return;
-    setSpeechError(null);
-    setSpeaking(true);
-    try {
-      const response = await postTextToSpeech({ text: plan.spokenSummary, language: 'unknown' });
-      const audio = audioRef.current;
-      if (!audio) throw new Error('Audio playback is not available.');
-      audio.src = `data:${response.mimeType};base64,${response.audioBase64}`;
-      await audio.play();
-      setHealth('connected');
-    } catch (speechRequestError) {
-      setHealth('offline');
-      setSpeaking(false);
-      setSpeechError(speechRequestError instanceof Error ? speechRequestError.message : 'Unable to speak the plan summary.');
-    }
-  };
-
-  const fillForm = async () => {
-    if (!plan || plan.status !== 'ready' || plan.actions.length === 0) return;
-    setFilling(true);
-    setError(null);
-    try {
-      const response = await sendToActiveTab({ type: 'SWARA_EXECUTE', actions: plan.actions });
-      const actionResults = extractResults(response);
-      if (!actionResults) throw new Error('The page returned an invalid fill result. Try reloading the tab.');
-      setResults(actionResults);
-
-      // Memory is committed only now, on acceptance — the preview promised
-      // what would be remembered. A failure here must not look like a failed
-      // fill, since the form was already filled successfully.
-      if (plan.memoryUpdates.length > 0) {
-        try {
-          await postMemoryApply({ sessionId, memoryUpdates: plan.memoryUpdates });
-          setMemorySaved(plan.memoryUpdates.length);
-        } catch {
-          setMemorySaved(null);
-        }
-      }
-    } catch (fillError) {
-      setError(fillError instanceof Error ? fillError.message : 'Unable to fill this form.');
-    } finally {
-      setFilling(false);
-    }
-  };
-
-  const fieldQuestion = (fieldId: string) =>
-    page?.fields.find((field) => field.fieldId === fieldId)?.question ?? fieldId;
-
-  const filledCount = results?.filter((result) => result.ok).length ?? 0;
 
   return (
     <main className="app">
       <header className="app-header">
-        <div>
-          <p className="eyebrow">Form companion</p>
-          <h1>Swara</h1>
-        </div>
-        <div className={`connection connection--${health}`} title={`Server ${health}`}>
-          <span className="connection-dot" />
-          <span>{health === 'connected' ? 'Connected' : health === 'checking' ? 'Checking' : 'Server offline'}</span>
+        <h1>Swara</h1>
+        <div className={`agent-state agent-state--${agentState}`} aria-live="polite">
+          <span className="state-mark" aria-hidden="true"><i /><i /><i /></span>
+          <span>{stateLabel(agentState)}</span>
         </div>
       </header>
 
-      <section className="workflow-section scan-section" aria-labelledby="scan-heading">
-        <div className="section-heading">
-          <div>
-            <p className="step">01</p>
-            <h2 id="scan-heading">Scan this page</h2>
+      <section className="conversation" aria-label="Conversation with Swara">
+        {conversation.length === 0 && !partialTranscript && (
+          <div className="conversation-empty">
+            <p>Start a voice session and Swara will read this page, then ask where to begin.</p>
           </div>
-          <button className="button button--secondary" type="button" onClick={() => void scanPage()} disabled={scanning}>
-            {scanning ? <><span className="spinner" />Scanning</> : 'Scan page'}
-          </button>
-        </div>
-        {page ? (
-          <>
-            <p className="page-title">{page.title}</p>
-            <p className="field-count">{page.fields.length} {page.fields.length === 1 ? 'field' : 'fields'} found</p>
-            <details className="field-list">
-              <summary>View extracted fields</summary>
-              <ul>
-                {page.fields.map((field) => (
-                  <li key={field.fieldId}>
-                    <span className="field-question">{field.question}</span>
-                    <span className="field-meta"><span className="badge">{field.type}</span>{field.required && <span className="required">Required</span>}</span>
-                  </li>
-                ))}
-              </ul>
-            </details>
-          </>
-        ) : <p className="hint">Scan the form to see its questions and prepare a plan.</p>}
-      </section>
-
-      <section className="workflow-section" aria-labelledby="instruct-heading">
-        <div className="section-heading">
-          <div>
-            <p className="step">02</p>
-            <h2 id="instruct-heading">What should Swara do?</h2>
-          </div>
-          <button
-            className={`mic-control${recording ? ' mic-control--recording' : ''}`}
-            type="button"
-            onClick={toggleRecording}
-            disabled={transcribing}
-            aria-pressed={recording}
-          >
-            <span className="mic-icon" aria-hidden="true">●</span>
-            {transcribing ? 'Transcribing' : recording ? 'Stop' : 'Start speaking'}
-          </button>
-        </div>
-        {recording && <p className="recording-status" aria-live="polite"><span className="recording-dot" />Recording · {recordingSeconds}s</p>}
-        <textarea
-          value={instruction}
-          onChange={(event) => setInstruction(event.target.value)}
-          placeholder="Fill this using my profile, use my AI experience, don't mention my current startup, keep it concise."
-          aria-label="Instructions for Swara"
-          rows={4}
-        />
-        {voiceError && (
-          <p className="voice-error" role="alert">
-            {voiceError}
-            {needsMicPermission && (
-              <button
-                type="button"
-                className="button button--secondary voice-permission"
-                onClick={() => {
-                  void openPermissionPage().then((failure) => {
-                    if (failure) setVoiceError(failure);
-                  });
-                }}
-              >
-                Grant microphone access
-              </button>
-            )}
-          </p>
         )}
-        <button className="button button--primary full-width" type="button" onClick={() => void createPlan()} disabled={!page || !instruction.trim() || planning}>
-          {planning ? <><span className="spinner" />Planning</> : 'Plan'}
-        </button>
+        {conversation.map((item) => <ConversationItemView key={item.id} item={item} />)}
+        {partialTranscript && <p className="turn turn--user turn--partial">{partialTranscript}<span className="live-caret" /></p>}
+        <div ref={transcriptEndRef} />
       </section>
 
-      {error && <p className="error" role="alert">{error}</p>}
+      {agentState === 'listening' && (
+        <div className="listening-feedback" aria-label="Swara is listening">
+          <span className="level-bars" style={{ '--level': Math.max(0.06, audioLevel).toString() } as React.CSSProperties}>
+            <i /><i /><i /><i /><i />
+          </span>
+          <span>Listening</span>
+        </div>
+      )}
 
-      {plan && (
-        <section className="preview" aria-labelledby="preview-heading">
-          <div className="preview-heading">
-            <p className="step">03</p>
-            <h2 id="preview-heading">Review the plan</h2>
-          </div>
-          <p className="plan-summary">{plan.actions.length} fields ready <span>·</span> {plan.relevantContext.length} pieces of context used</p>
-          <div className="speak-summary">
-            <button className="button button--secondary" type="button" onClick={() => void speakSummary()} disabled={!plan.spokenSummary || speaking}>
-              {speaking ? <><span className="spinner" />Speaking</> : 'Speak summary'}
+      <form className="text-turn" onSubmit={submitTypedTurn}>
+        <label className="sr-only" htmlFor="typed-turn">Send a typed message</label>
+        <input
+          id="typed-turn"
+          value={typedText}
+          onChange={(event) => setTypedText(event.target.value)}
+          disabled={!sessionOpen}
+          placeholder={sessionOpen ? 'Type instead' : 'Start a voice session to type'}
+        />
+        <button type="submit" disabled={!sessionOpen || !typedText.trim()}>Send</button>
+      </form>
+
+      <div className="session-control">
+        <button
+          className={`mic-button${sessionOpen ? ' mic-button--active' : ''}`}
+          type="button"
+          onClick={() => void startSession()}
+          aria-pressed={sessionOpen}
+          aria-label={sessionOpen ? 'End voice session' : 'Start voice session'}
+        >
+          <span className="mic-shape" aria-hidden="true" />
+          <span>{sessionOpen ? 'End session' : 'Start speaking'}</span>
+        </button>
+      </div>
+
+      {(context.relevant.length > 0 || context.excluded.length > 0) && (
+        <details className="reasoning-sidecar">
+          <summary>Reasoning context</summary>
+          <ContextList title="Relevant" items={context.relevant} />
+          <ContextList title="Excluded" items={context.excluded} excluded />
+        </details>
+      )}
+
+      {error && (
+        <p className="error" role="alert">
+          {error}
+          {needsMicPermission && (
+            <button type="button" className="permission-button" onClick={() => void openPermissionPage()}>
+              Grant microphone access
             </button>
-            {speechError && <p className="voice-error" role="alert">{speechError}</p>}
-          </div>
-
-          {plan.status === 'needs_clarification' && (
-            <section className="clarifications" aria-label="Clarifications needed">
-              <h3>Before filling, Swara needs your input</h3>
-              <ul>{plan.clarifications.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul>
-            </section>
           )}
-
-          <PlanSection title="Context used" className="context-used">
-            {plan.relevantContext.length ? plan.relevantContext.map((item) => (
-              <div className="context-item" key={`${item.key}-${item.reason}`}><span className="check-mark">✓</span><p><strong>{item.key}</strong><span>{item.reason}</span></p></div>
-            )) : <p className="empty-copy">No saved context was needed.</p>}
-          </PlanSection>
-
-          <PlanSection title="Excluded" className="context-excluded">
-            {plan.excludedContext.length ? plan.excludedContext.map((item) => (
-              <div className="context-item excluded" key={`${item.key}-${item.reason}`}><span className="exclude-mark">—</span><p><strong>{item.key}</strong><span>{item.reason}</span></p></div>
-            )) : <p className="empty-copy">No context was excluded.</p>}
-          </PlanSection>
-
-          <PlanSection title="Memory" className="memory-section">
-            {plan.memoryUpdates.length ? plan.memoryUpdates.map((memory, index) => (
-              <article className="memory-card" key={`${memory.key}-${index}`}>
-                <div className="memory-badges"><span className={`badge memory-type memory-type--${memory.type}`}>{memory.type}</span><span className="badge scope-badge">{memory.scope}</span></div>
-                <strong>{memory.key}</strong>
-                <p className="memory-value">{memory.value}</p>
-                {memory.oldValue && <p className="old-value">Replaces: {memory.oldValue}</p>}
-                <p className="memory-reason">{memory.reason}</p>
-              </article>
-            )) : <p className="empty-copy">No memory updates proposed.</p>}
-          </PlanSection>
-
-          <PlanSection title="Proposed actions" className="actions-section">
-            {plan.actions.map((action, index) => {
-              const isLong = action.value.length > 140;
-              const isExpanded = expandedActions.has(index);
-              return <article className="action-card" key={`${action.fieldId}-${index}`}>
-                <div className="action-topline"><strong>{fieldQuestion(action.fieldId)}</strong><span className="badge action-badge">{action.action}</span></div>
-                <p className={isLong && !isExpanded ? 'action-value is-truncated' : 'action-value'}>{action.value || 'No value required'}</p>
-                {isLong && <button className="text-button" type="button" onClick={() => setExpandedActions((current) => { const next = new Set(current); isExpanded ? next.delete(index) : next.add(index); return next; })}>{isExpanded ? 'Show less' : 'Show full value'}</button>}
-                {action.reasoning && <p className="action-reasoning">{action.reasoning}</p>}
-              </article>;
-            })}
-          </PlanSection>
-
-          {plan.unresolved.length > 0 && <p className="unresolved">Left unchanged: {plan.unresolved.join(' · ')}</p>}
-
-          <button className="button button--primary full-width fill-button" type="button" onClick={() => void fillForm()} disabled={plan.status !== 'ready' || plan.actions.length === 0 || filling}>
-            {filling ? <><span className="spinner" />Filling form</> : 'Fill form'}
-          </button>
-        </section>
+        </p>
       )}
-
-      {results && (
-        <section className="results" aria-live="polite">
-          <p className="results-summary">
-            {filledCount} of {results.length} filled
-            {memorySaved !== null && ` · ${memorySaved} remembered`}
-          </p>
-          <ul>{results.map((result, index) => <li className={result.ok ? 'result-ok' : 'result-error'} key={`${result.fieldId}-${index}`}><span>{result.ok ? 'OK' : 'Error'}</span><p><strong>{fieldQuestion(result.fieldId)}</strong>{result.error && <small>{result.error}</small>}</p></li>)}</ul>
-        </section>
-      )}
-      <audio ref={audioRef} onEnded={() => setSpeaking(false)} />
     </main>
   );
 }
 
-function PlanSection({ title, className, children }: { title: string; className: string; children: React.ReactNode }) {
-  return <section className={`plan-section ${className}`}><h3>{title}</h3>{children}</section>;
+function stateLabel(state: AgentState): string {
+  return {
+    connecting: 'Connecting',
+    idle: 'Ready',
+    listening: 'Listening',
+    thinking: 'Thinking',
+    speaking: 'Speaking',
+    acting: 'Acting',
+    error: 'Needs attention',
+  }[state];
+}
+
+function ConversationItemView({ item }: { item: ConversationItem }) {
+  if (item.kind === 'actions') {
+    return (
+      <article className={`turn-artifact action-artifact${item.results ? ' action-artifact--done' : ''}`}>
+        <p>{actionSummary(item.actions, item.results)}</p>
+        {item.results && <ActionResults results={item.results} />}
+      </article>
+    );
+  }
+  if (item.kind === 'memory') {
+    return <article className="turn-artifact memory-artifact"><p>Remembered</p>{item.updates.map((update, index) => <div className="memory-update" key={`${update.key}-${index}`}><span className={`memory-badge memory-badge--${update.type}`}>{update.type}</span><span className="scope-badge">{update.scope}</span><strong>{update.key}</strong><span className="memory-value">{update.value}</span></div>)}</article>;
+  }
+  return <p className={`turn turn--${item.kind}`}>{item.text}</p>;
+}
+
+function ActionResults({ results }: { results: ActionResult[] }) {
+  const failures = results.filter((result) => !result.ok);
+  if (failures.length === 0) return null;
+  return <small>{failures.map((result) => result.error || `${result.fieldId} could not be filled`).join(' · ')}</small>;
+}
+
+function ContextList({ title, items, excluded = false }: { title: string; items: ContextUsage[]; excluded?: boolean }) {
+  if (!items.length) return null;
+  return (
+    <section className={excluded ? 'context-list context-list--excluded' : 'context-list'}>
+      <h2>{title}</h2>
+      {items.map((item) => <p key={`${item.key}-${item.reason}`}><strong>{item.key}</strong><span>{item.summary} · {item.reason}</span></p>)}
+    </section>
+  );
 }
 
 export default App;
