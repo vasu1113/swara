@@ -35,6 +35,8 @@ type PlaybackChunk = { data: string; mimeType: string };
 
 const MP3_MIME = 'audio/mpeg';
 const PCM_MIME = 'audio/pcm';
+/** Fallback when the server doesn't state a rate. */
+const TTS_SAMPLE_RATE = 24_000;
 
 /**
  * Plays raw 16 kHz PCM chunks gaplessly through Web Audio.
@@ -49,15 +51,17 @@ class PcmPlayer {
   private cursor = 0;
   private sources = new Set<AudioBufferSourceNode>();
 
-  push(bytes: Uint8Array) {
-    if (!this.ctx) this.ctx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE });
+  push(bytes: Uint8Array, rate: number) {
+    // The agent speaks at a different rate than we capture at, so the context
+    // follows the incoming audio rather than assuming the capture rate.
+    if (!this.ctx) this.ctx = new AudioContext({ sampleRate: rate });
     const ctx = this.ctx;
     const samples = new Int16Array(
       bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
     );
     if (!samples.length) return;
 
-    const buffer = ctx.createBuffer(1, samples.length, AUDIO_SAMPLE_RATE);
+    const buffer = ctx.createBuffer(1, samples.length, rate);
     const channel = buffer.getChannelData(0);
     for (let i = 0; i < samples.length; i += 1) channel[i] = samples[i] / 0x8000;
 
@@ -410,7 +414,8 @@ function App() {
         return;
       case 'agent.audio':
         if (message.mimeType.startsWith(PCM_MIME)) {
-          pcmPlayerRef.current.push(fromBase64(message.data));
+          const rate = Number(/rate=(\d+)/.exec(message.mimeType)?.[1]) || TTS_SAMPLE_RATE;
+          pcmPlayerRef.current.push(fromBase64(message.data), rate);
           return;
         }
         playbackQueueRef.current.push({ data: message.data, mimeType: message.mimeType });
