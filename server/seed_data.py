@@ -33,42 +33,23 @@ SEED_PROFILE: list[ContextItem] = [
         key="university",
         value="Manipal Institute of Technology",
     ),
+    # Deliberately incomplete: true as far as it goes, but omits the minor.
+    # The live demo corrects this, which is why it isn't stated in full here.
     ContextItem(
         type="fact",
         category="education",
         key="degree",
-        value="Bachelor of Technology in Computer Science and Engineering",
+        value="B.Tech in Mechanical Engineering",
     ),
     ContextItem(type="fact", category="education", key="graduation_year", value="2025"),
-    ContextItem(
-        type="fact",
-        category="experience",
-        key="hyperverge",
-        value="Worked on AI and compliance-automation products at HyperVerge.",
-    ),
+    # Work history is NOT seeded. It comes from the uploaded resume via OCR,
+    # which is both the honest source and the better demo: the vault fills
+    # itself from a real document rather than from facts we typed in.
     ContextItem(
         type="fact",
         category="experience",
         key="current_startup",
-        value="Currently building Swara, a context-aware assistant for form filling.",
-    ),
-    ContextItem(
-        type="fact",
-        category="skills",
-        key="programming_languages",
-        value="Python, TypeScript, JavaScript, SQL",
-    ),
-    ContextItem(
-        type="fact",
-        category="skills",
-        key="ai_skills",
-        value="Applied AI, LLM integrations, document processing, prompt engineering",
-    ),
-    ContextItem(
-        type="fact",
-        category="skills",
-        key="engineering_skills",
-        value="FastAPI, React, Supabase, REST APIs, automation",
+        value="Currently building Swara, a voice-native personal context layer.",
     ),
     ContextItem(
         type="preference",
