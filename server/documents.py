@@ -9,16 +9,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
-
-from fastapi import APIRouter, HTTPException, UploadFile
 
 from config import require
-from context_store import add_context
-from schemas import ContextItem
-
-
-router = APIRouter(prefix="/documents", tags=["documents"])
 
 ALLOWED_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".zip"}
 MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
@@ -157,86 +149,7 @@ def _set_document_status(client: Any, document_id: str, status: str, **values: A
     client.table("documents").update({"status": status, **values}).eq("id", document_id).execute()
 
 
-@router.post("/upload")
-async def upload_document(file: UploadFile) -> dict[str, Any]:
-    """Upload a document, OCR it with Sarvam, and make its text searchable context."""
-    filename = Path(file.filename or "").name
-    suffix = Path(filename).suffix.lower()
-    if not filename or suffix not in ALLOWED_SUFFIXES:
-        raise HTTPException(status_code=400, detail="Only PDF, PNG, JPEG, and ZIP documents are supported.")
-
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="The uploaded document is empty.")
-    if len(content) > MAX_DOCUMENT_BYTES:
-        raise HTTPException(status_code=413, detail="Documents must be 20 MB or smaller.")
-
-    client = _supabase_client()
-    storage_path = f"{uuid4()}/{filename}"
-    try:
-        client.storage.from_("documents").upload(
-            path=storage_path,
-            file=content,
-            file_options={"content-type": file.content_type or "application/octet-stream"},
-        )
-        document_response = (
-            client.table("documents")
-            .insert({"filename": filename, "storage_path": storage_path, "status": "pending"})
-            .execute()
-        )
-        if not document_response.data:
-            raise RuntimeError("Supabase did not return the created document row.")
-        document_id = str(document_response.data[0]["id"])
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not store document: {exc}") from exc
-
-    try:
-        _set_document_status(client, document_id, "processing")
-        job_metadata, markdown = _run_sarvam_ocr(content, filename)
-
-        # Keep the job metadata and the full extracted text, so a document can
-        # be re-chunked later without paying for OCR again.
-        raw_output = {**job_metadata, "markdown": markdown}
-        _set_document_status(client, document_id, "processing", ocr_output=raw_output, error=None)
-
-        sections = _markdown_sections(markdown)
-        inserted_context = [
-            add_context(
-                ContextItem(
-                    type="document",
-                    category=heading.lower(),
-                    key=f"document:{document_id}:{heading.lower().replace(' ', '_')}",
-                    value=body[:OCR_CHUNK_SIZE],
-                    source=filename,
-                    source_type="document",
-                    scope="persistent",
-                    document_id=document_id,
-                )
-            )
-            for heading, body in sections
-        ]
-        _set_document_status(client, document_id, "done", error=None)
-        return {
-            "id": document_id,
-            "filename": filename,
-            "status": "done",
-            "contextItemsCreated": len(inserted_context),
-        }
-    except RuntimeError as exc:
-        # A missing key is a configuration issue and should remain explicit, but
-        # the persisted document must not remain stuck in pending/processing.
-        try:
-            _set_document_status(client, document_id, "failed", error=str(exc)[:2_000])
-        except Exception:
-            pass
-        raise
-    except Exception as exc:
-        try:
-            _set_document_status(client, document_id, "failed", error=str(exc)[:2_000])
-        except Exception:
-            pass
-        raise HTTPException(status_code=502, detail=f"Document OCR failed: {exc}") from exc
-    finally:
-        await file.close()
+# This module used to own `POST /documents/upload` too. `vault.py` now serves
+# that path with a version that returns immediately and OCRs in the background,
+# and its router is mounted first — so the handler here was shadowed and
+# unreachable. What remains is the OCR library `vault.py` builds on.
